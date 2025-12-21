@@ -1,0 +1,11 @@
+Manifest.toml
+*.jl.cov
+*.jl.mem
+/.julia/
+/deps/build.log
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
