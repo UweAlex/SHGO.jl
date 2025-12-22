@@ -1,25 +1,21 @@
-module SHGO
-
 using StaticArrays
-using NonlinearOptimizationTestFunctions  # Deine Bibliothek
+using NonlinearOptimizationTestFunctions
+using SciMLBase
 
-# Kern-Typen
 struct Simplex{N}
-    vertices::NTuple{N+1, SVector{N, Float64}}  # Koordinaten
-    indices::NTuple{N+1, CartesianIndex{N}}    # Gitter-Indizes für Cache
+    vertices::Vector{SVector{N, Float64}}
+    indices::Vector{CartesianIndex{N}}
 end
 
 struct Region{N}
     simplices::Vector{Simplex{N}}
 end
 
-struct SHGOResult{N}
-    global_minimum::OptimizationSolution
-    local_minima::Vector{OptimizationSolution}
+# Wir machen die Result-Struktur einfach und ohne N-Parameter
+struct SHGOResult
+    global_minimum::Any
+    local_minima::Vector{Any}
     num_basins::Int
-    # Optional: graph, homology etc.
 end
 
-export solve, analyze, SHGOResult
-
-end  # module
+export Simplex, Region, SHGOResult

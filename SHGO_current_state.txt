@@ -1,3 +1,17 @@
+=== SHGO.jl - Aktueller Code-Stand === 
+Generiert am 22.12.2025 um 19:10:02,76 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\Project.toml" 
+```julia 
+[deps]
+``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\README.md" 
+```julia 
 ### Zusammenfassung unseres Projekts SHGO.jl
 
 Unser Projekt begann mit deiner Motivation, **Multimodalität** in Testfunktionen zuverlässig zu erkennen, und entwickelte sich zu einer tiefen konzeptionellen und praktischen Auseinandersetzung mit globaler Optimierung und Funktionsanalyse.
@@ -249,55 +263,277 @@ Future work may explore:
 
 We believe that **understanding the landscape** is the prerequisite for systematically advancing optimization algorithms.
 
-Das ist ein hervorragender Moment, um innezuhalten. Dass wir von einem Berg an `LoadErrors` zu einer stabilen Pipeline mit **6/6 bestandenen Tests** gekommen sind, ist der wichtigste Meilenstein in der Softwareentwicklung: Der Übergang von "geht nicht" zu "funktioniert, muss jetzt nur noch rechnen".
+``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\.gitignore" 
+```julia 
+Manifest.toml
+*.jl.cov
+*.jl.mem
+/.julia/
+/deps/build.log
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\src\cache.jl" 
+```julia 
+using StaticArrays
+using Base.Threads
 
-Hier ist der technische Bericht über die Entwicklung und den aktuellen Stand von **SHGO.jl**.
+struct VertexCache{N}
+    storage::Dict{CartesianIndex{N}, Tuple{Float64, SVector{N, Float64}}}
+    lock::ReentrantLock
+    tf::TestFunction
+    lb::SVector{N, Float64}
+    ub::SVector{N, Float64}
+    cell_width::SVector{N, Float64}
+end
 
----
+function VertexCache(tf::TestFunction, divisions::NTuple{N, Int}) where N
+    lb = SVector{N}(lb(tf))
+    ub = SVector{N}(ub(tf))
+    cell_width = (ub - lb) ./ SVector{N}(divisions)
+    VertexCache(
+        Dict(),
+        ReentrantLock(),
+        tf, lb, ub, cell_width
+    )
+end
 
-## Projektbericht: Etablierung der Test-Pipeline für SHGO.jl
+function get_vertex!(cache::VertexCache{N}, idx::CartesianIndex{N}) where N
+    lock(cache.lock) do
+        get!(cache.storage, idx) do
+            x = cache.lb .+ (SVector(idx.I...) .- 1) .* cache.cell_width
+            f = cache.tf.f(x)
+            g = cache.tf.grad(x)
+            (f, g)
+        end
+    end
+end``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\src\SHGO.jl" 
+```julia 
+module SHGO
 
-### 1. Entwicklung der `Project.toml` und Infrastruktur
+using StaticArrays
+using LazySets
+using Graphs
+using Optimization
+using OptimizationOptimJL
+using Base.Threads  # Für Lock in Cache
 
-Am Anfang stand die Herausforderung, dass die Abhängigkeiten (Dependencies) nicht sauber aufeinander abgestimmt waren.
+include("types.jl")
+include("cache.jl")
+include("triangulation/kuhn.jl")
+include("pruning/gradient_hull.jl")
+include("pruning/value_pruning.jl")
+include("clustering.jl")
+include("local_search.jl")
 
-**Was geändert wurde:**
+export analyze, SHGOResult
 
-* **Version-Alignment:** Wir mussten sicherstellen, dass `Optimization.jl`, `SciMLBase` und deine eigene Library `NonlinearOptimizationTestFunctions.jl` (NOTF) harmonieren.
-* **Explizite Abhängigkeiten:** Fehlende Pakete wie `LinearAlgebra`, `StaticArrays` und `SciMLBase` wurden direkt in die `Project.toml` aufgenommen, damit Julia nicht auf globale Umgebungen zugreifen muss.
-* **Manifest-Fix:** Durch `Pkg.resolve()` und `Pkg.instantiate()` wurde sichergestellt, dass der exakte "State" deines Laptops mit dem Code synchronisiert ist.
+# Dummy-Stub: Gibt immer dasselbe zurück – Tests laufen, aber scheitern bei Assertions
+function analyze(tf::TestFunction; kwargs...)
+    dummy_sol = OptimizationSolution(zeros(length(tf.lb)), 0.0)  # Dummy Minimizer/Objective
+    SHGOResult(dummy_sol, [dummy_sol], 0)  # basins=0, um @test num_basins == 1 scheitern zu lassen
+end
 
-### 2. Zentrale Code-Änderungen für die Lauffähigkeit
+end # module``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\src\types.jl" 
+```julia 
+module SHGO
 
-Um die "Schildkröte zu fangen" (die Fehler zu beseitigen), waren drei chirurgische Eingriffe nötig:
+using StaticArrays
+using NonlinearOptimizationTestFunctions  # Deine Bibliothek
 
-* **Namensraum-Bereinigung:** Julia ist streng. Wir haben von impliziten Aufrufen auf explizite Aufrufe umgestellt (`NOTF.lb(tf)` statt `tf.lb`). Das hat die `UndefVarErrors` beseitigt.
-* **Typ-Entkoppelung (The "Any" Strategy):** In `src/types.jl` haben wir die `SHGOResult`-Struktur flexibler gestaltet. Indem wir komplexe Typ-Parameter `{N}` entfernt und durch `Any` ersetzt haben, konnten wir den `MethodError` bei der Objekterstellung umgehen.
-* **Test-Syntax:** In `test/test_pipeline.jl` wurden `const`-Deklarationen entfernt, da Julia innerhalb von Testblöcken keine Konstanten erlaubt.
+# Kern-Typen
+struct Simplex{N}
+    vertices::NTuple{N+1, SVector{N, Float64}}  # Koordinaten
+    indices::NTuple{N+1, CartesianIndex{N}}    # Gitter-Indizes für Cache
+end
 
-### 3. Was der Test aktuell testet
+struct Region{N}
+    simplices::Vector{Simplex{N}}
+end
 
-Momentan führt der Befehl `include("test/runtests.jl")` eine sogenannte **"Sanity Check" Pipeline** aus:
+struct SHGOResult{N}
+    global_minimum::OptimizationSolution
+    local_minima::Vector{OptimizationSolution}
+    num_basins::Int
+    # Optional: graph, homology etc.
+end
 
-1. **Lade-Test:** Kann das Modul `SHGO` fehlerfrei geladen werden?
-2. **Schnittstellen-Test:** Akzeptiert die Funktion `analyze` eine `TestFunction` aus deiner Library?
-3. **Typ-Validierung:** Ist das zurückgegebene Objekt wirklich ein `SHGOResult`?
-4. **Accessor-Validierung:** Funktionieren die Aufrufe von `lb()`, `ub()` und `start()` innerhalb des Algorithmus?
+export solve, analyze, SHGOResult
 
-Dass **6/6 Tests bestehen**, bedeutet, dass die Daten fließen – auch wenn wir momentan noch "Dummy-Werte" (0 Basins) zurückgeben, um die Technik nicht zu überlasten.
+end  # module``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\src\triangulation\kuhn.jl" 
+```julia 
+# Einfacher, nicht-allozierender Heap-Permutations-Iterator (für N! Permutationen)
+struct HeapPermutationIterator
+    n::Int
+    data::Vector{Int}
+end
 
-### 4. Wie es weitergeht: Die mathematische Phase
+HeapPermutationIterator(n::Int) = HeapPermutationIterator(n, collect(1:n))
 
-Jetzt, wo das Fundament aus Beton gegossen ist, folgt der Bau des Hauses. Der Fahrplan sieht wie folgt aus:
+function Base.iterate(iter::HeapPermutationIterator, state=iter.data)
+    # Heap's Algorithm – modifiziert für Iterator
+    # Gibt SVector zurück, keine Allocation
+    # (Vereinfachte Version – vollständige Implementierung in Phase 1 erweitern)
+    # Für Demo: yield alle Permutationen
+    # ...
+end
 
-* **Schritt A: Die Kuhn-Triangulation:** Implementierung der Logik in `src/triangulation/kuhn.jl`. Wir zerlegen den Suchraum in Simplizes. Das ist die "Landkarte", auf der die Schildkröte wandert.
-* **Schritt B: Sampling & Evaluation:** Wir werten die Zielfunktion an den Eckpunkten der Simplizes aus.
-* **Schritt C: Homologie-Suche:** Wir identifizieren, welche Simplizes zu denselben "Tälern" (Basins) gehören.
-* **Schritt D: Lokale Optimierung:** Aus jedem gefundenen Tal starten wir einen lokalen Optimierer (via `Optimization.jl`), um das exakte Minimum zu finden.
+# Lazy Kuhn-Simplex-Generator pro Zelle
+struct LazyKuhnSimplexes{N}
+    cell_origin_idx::CartesianIndex{N}
+    cache::VertexCache{N}
+end
 
----
+function Base.iterate(iter::LazyKuhnSimplexes{N}, perm_iter = HeapPermutationIterator(N)) where N
+    next_perm = iterate(perm_iter)
+    next_perm === nothing && return nothing
 
-**Nächster konkreter Schritt:**
-Wir müssen jetzt `Combinatorics.jl` fest im Projekt verankern und die erste echte Triangulation in `analyze` aufrufen.
+    perm, perm_state = next_perm
+    # Generiere Simplex-Indizes aus Permutation (Kuhn-Regel)
+    indices = generate_kuhn_indices(iter.cell_origin_idx, perm)
 
-**Soll ich dir dabei helfen, die `analyze`-Funktion so umzubauen, dass sie zum ersten Mal echte Simplizes erzeugt und deren Eckpunkte ausgibt?** Dann würden wir sehen, wie der Algorithmus den Raum "versteht".
+    # Hole Daten aus Cache
+    vertex_data = [get_vertex!(iter.cache, idx) for idx in indices]
+    grads = [d[2] for d in vertex_data]
+
+    # Sofort Pruning (Gradient-Hull)
+    hull = ConvexHullArray([Singleton(g) for g in grads])
+    if !(zeros(N) ∈ hull)
+        return iterate(iter, perm_state)  # verworfen → nächster
+    end
+
+    # Überlebt → Simplex zurückgeben
+    vertices = [iter.cache.lb .+ (SVector(idx.I...) .- 1) .* iter.cache.cell_width for idx in indices]
+    simplex = Simplex(tuple(vertices...), indices)
+
+    (simplex, perm_state)
+end``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\test\runtests.jl" 
+```julia 
+#test/runtests.jl
+
+using SHGO
+using Test
+
+@testset "SHGO.jl" begin
+    include("test_pipeline.jl")
+end``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 
+ 
+"Datei: C:\Users\uweal\SHGO.jl\test\test_pipeline.jl" 
+```julia 
+# test/test_pipeline.jl
+using SHGO
+using Test
+using NonlinearOptimizationTestFunctions
+using StaticArrays
+
+@testset "SHGO.jl - Pipeline Tests (2D Reference Cases)" begin
+
+    # Toleranzen
+    const POS_TOL = 1e-4   # Positionstoleranz für Minima-Vergleich
+    const VAL_TOL = 1e-6   # Werttoleranz
+
+    # Hilfsfunktion: Vergleiche gefundene Minima mit bekannten
+    function check_minima(res::SHGOResult, expected_positions, expected_values)
+        @test res.num_basins == length(expected_positions)
+
+        found_mins = [sol.minimizer for sol in res.local_minima]
+        found_vals = [sol.objective for sol in res.local_minima]
+
+        # Jede bekannte Position muss ein gefundenes Minimum in Toleranz haben
+        for (exp_pos, exp_val) in zip(expected_positions, expected_values)
+            matched = false
+            for (f_pos, f_val) in zip(found_mins, found_vals)
+                if norm(f_pos - exp_pos) < POS_TOL && abs(f_val - exp_val) < VAL_TOL
+                    matched = true
+                    break
+                end
+            end
+            @test matched
+        end
+    end
+
+    @testset "Sphere (unimodal)" begin
+        tf = fixed(SPHERE_FUNCTION; n=2)
+        res = analyze(tf; max_evals=5000)
+
+        @test res.num_basins == 1
+        @test norm(res.global_minimum.minimizer) < 1e-5
+        @test res.global_minimum.objective < 1e-10
+    end
+
+    @testset "Rosenbrock (unimodal, ill-conditioned)" begin
+        tf = fixed(ROSENBROCK_FUNCTION; n=2)
+        res = analyze(tf; max_evals=10000)
+
+        @test res.num_basins == 1
+        @test norm(res.global_minimum.minimizer - SVector(1.0, 1.0)) < 1e-4
+        @test res.global_minimum.objective < 1e-8
+    end
+
+    @testset "Himmelblau (4 identische Minima)" begin
+        tf = HIMMELBLAU_FUNCTION  # fixed n=2
+        expected_pos = [
+            SVector( 3.0,  2.0),
+            SVector(-2.805118,  3.131312),
+            SVector(-3.779310, -3.283186),
+            SVector( 3.584428, -1.848126)
+        ]
+        expected_val = 0.0
+
+        res = analyze(tf; max_evals=20000)
+
+        @test res.num_basins == 4
+        check_minima(res, expected_pos, fill(expected_val, 4))
+    end
+
+    @testset "Six-Hump Camel (6 Minima, 2 global)" begin
+        tf = SIXHUMP_CAMEL_FUNCTION  # fixed n=2
+        # Bekannte 2 globale Minima bei ca. f ≈ -1.0316
+        # 4 lokale höher
+        res = analyze(tf; max_evals=30000)
+
+        @test res.num_basins == 6
+        global_mins = filter(sol -> abs(sol.objective + 1.031628453) < 1e-4, res.local_minima)
+        @test length(global_mins) == 2
+    end
+
+    @testset "Rastrigin (2D – viele Minima, symmetrisch)" begin
+        tf = fixed(RASTRIGIN_FUNCTION; n=2)
+        res = analyze(tf; max_evals=50000)
+
+        @test res.num_basins > 10  # In 2D viele lokale Minima
+        @test res.global_minimum.objective < 0.1  # Globales Minimum nahe 0
+    end
+
+end``` 
+ 
+------------------------Dateitrennzeichen--------------------------------------------- 

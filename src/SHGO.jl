@@ -1,27 +1,33 @@
 module SHGO
 
 using StaticArrays
-using LazySets
-using Graphs
-using Optimization
-using OptimizationOptimJL
-using ConcurrentCollections
 using NonlinearOptimizationTestFunctions
+using SciMLBase
+using LinearAlgebra
 
+# Alias
+const NOTF = NonlinearOptimizationTestFunctions
+
+# Teile laden
 include("types.jl")
 include("cache.jl")
 include("triangulation/kuhn.jl")
-include("pruning/gradient_hull.jl")
-include("pruning/value_pruning.jl")
-include("clustering.jl")
-include("local_search.jl")
 
 export analyze, SHGOResult
 
-# Haupt-API – später erweitern
-function analyze(tf::TestFunction; kwargs...)
-    # Platzhalter – wird in Phase 1 gefüllt
-    error("Not implemented yet – Phase 1 in progress")
+function analyze(tf::NOTF.TestFunction; kwargs...)
+    x_start = NOTF.start(tf)
+    f_val   = tf.f(x_start)
+    
+    # Wir bauen eine einfache Struktur, die mit 'Any' in SHGOResult kompatibel ist
+    # Das vermeidet den MethodError von SciMLBase komplett
+    dummy_sol = (u = x_start, objective = f_val, retcode = ReturnCode.Success)
+    
+    return SHGOResult(
+        dummy_sol,      # global_minimum
+        [dummy_sol],    # local_minima
+        0               # num_basins (hier schlägt der Test gleich FEHL, nicht ERROR)
+    )
 end
 
-end # module SHGO
+end # module

@@ -1,18 +1,11 @@
 name = "SHGO"
-uuid = "c0d0e1f2-3a4b-5c6d-7e8f-9a0b1c2d3e4f"  # Generiere neu mit `Pkg.generate` oder uuidgen
-version = "0.1.0"
-
-authors = ["Dein Name <deine@email.de>"]
-license = "MIT"
 
 [deps]
-ConcurrentCollections = "8f4e5e8c-9a4e-4f2a-9f56-5f3b7d1a9b0c"
-Graphs = "86223c79-8f4c-4f2d-9b4a-4d8f6a9b0c0d"
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
 LazySets = "b4f0291d-fe17-52bc-9479-3d1a343d9043"
-Optimization = "7f7a1694-90dd-40f1-9384-4793d0a7f2a4"
-OptimizationOptimJL = "363d8c7f-5f4a-4d3a-9f4a-4d3a9f4a4d3a"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+NonlinearOptimizationTestFunctions = "3180b13f-e8d1-40aa-806b-3e6ce7522c6b"
+Optimization = "7f7a1694-90dd-40f0-9382-eb1efda571ba"
+OptimizationOptimJL = "36348300-93cb-4f02-beb5-3c3902f8871e"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-NonlinearOptimizationTestFunctions = "dein-uuid-hier"  # Deine Bibliothek
-
-[compat]
-julia = "1.9"
