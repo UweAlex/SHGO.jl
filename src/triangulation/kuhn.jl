@@ -1,46 +1,116 @@
-# Einfacher, nicht-allozierender Heap-Permutations-Iterator (für N! Permutationen)
-struct HeapPermutationIterator
-    n::Int
-    data::Vector{Int}
+# src/triangulation/kuhn.jl
+using StaticArrays
+using LazySets
+
+# ────────────────────────────────────────────────────────────────
+# Heap's Algorithm – Permutations-Generator
+# ────────────────────────────────────────────────────────────────
+
+struct KuhnPermutationIterator{N} end
+
+function KuhnPermutationIterator(n::Int)
+    n < 0 && throw(ArgumentError("n muss >= 0 sein"))
+    KuhnPermutationIterator{n}()
 end
 
-HeapPermutationIterator(n::Int) = HeapPermutationIterator(n, collect(1:n))
+# Initialer Aufruf (ohne state)
+function Base.iterate(it::KuhnPermutationIterator{N}) where N
+    N == 0 && return nothing
 
-function Base.iterate(iter::HeapPermutationIterator, state=iter.data)
-    # Heap's Algorithm – modifiziert für Iterator
-    # Gibt SVector zurück, keine Allocation
-    # (Vereinfachte Version – vollständige Implementierung in Phase 1 erweitern)
-    # Für Demo: yield alle Permutationen
-    # ...
+    p = MVector{N, Int}(1:N)
+    c = MVector{N, Int}(zeros(Int, N))
+    return SVector{N, Int}(p), (p, c, 1)
 end
 
-# Lazy Kuhn-Simplex-Generator pro Zelle
+# Fortsetzung mit state (nur für gültigen Tuple-Zustand)
+function Base.iterate(it::KuhnPermutationIterator{N}, state::Tuple) where N
+    p, c, k = state
+
+    while k ≤ N
+        if c[k] < k - 1
+            if isodd(k)
+                p[1], p[k] = p[k], p[1]
+            else
+                j = c[k] + 1
+                p[j], p[k] = p[k], p[j]
+            end
+
+            c[k] += 1
+            return SVector{N, Int}(p), (p, c, 1)  # Reset k
+        else
+            c[k] = 0
+            k += 1
+        end
+    end
+
+    nothing
+end
+
+Base.length(::KuhnPermutationIterator{N}) where N = factorial(N)
+Base.eltype(::Type{KuhnPermutationIterator{N}}) where N = SVector{N, Int}
+
+# ────────────────────────────────────────────────────────────────
+# 2. Kuhn-Indizes aus Ursprung + Permutation
+# ────────────────────────────────────────────────────────────────
+
+function generate_kuhn_indices(origin::CartesianIndex{N}, perm::SVector{N,Int}) where N
+    indices = Vector{CartesianIndex{N}}(undef, N+1)
+    indices[1] = origin
+
+    current = origin
+    for j in 1:N
+        dim = perm[j]
+        offset = ntuple(i -> i == dim ? 1 : 0, Val(N))
+        current += CartesianIndex(offset)
+        indices[j+1] = current
+    end
+
+    indices
+end
+
+# ────────────────────────────────────────────────────────────────
+# 3. Lazy Iterator mit Gradient-Hull-Pruning (deterministisch, stabil)
+# ────────────────────────────────────────────────────────────────
+
 struct LazyKuhnSimplexes{N}
     cell_origin_idx::CartesianIndex{N}
     cache::VertexCache{N}
 end
 
-function Base.iterate(iter::LazyKuhnSimplexes{N}, perm_iter = HeapPermutationIterator(N)) where N
-    next_perm = iterate(perm_iter)
-    next_perm === nothing && return nothing
+Base.IteratorSize(::Type{<:LazyKuhnSimplexes}) = Base.SizeUnknown()
+Base.eltype(::Type{LazyKuhnSimplexes{N}}) where N = Simplex{N}
 
-    perm, perm_state = next_perm
-    # Generiere Simplex-Indizes aus Permutation (Kuhn-Regel)
+function Base.iterate(iter::LazyKuhnSimplexes{N}, state=nothing) where N
+    perm_iter = KuhnPermutationIterator(N)
+
+    # Zustand: nichts = Start, sonst vorheriger Permutations-Zustand
+    perm_state = state
+
+    # Explizite Unterscheidung: Start oder Fortsetzung
+    next = perm_state === nothing ? iterate(perm_iter) : iterate(perm_iter, perm_state)
+    next === nothing && return nothing
+
+    perm, new_perm_state = next
+
     indices = generate_kuhn_indices(iter.cell_origin_idx, perm)
 
-    # Hole Daten aus Cache
     vertex_data = [get_vertex!(iter.cache, idx) for idx in indices]
     grads = [d[2] for d in vertex_data]
 
-    # Sofort Pruning (Gradient-Hull)
     hull = ConvexHullArray([Singleton(g) for g in grads])
-    if !(zeros(N) ∈ hull)
-        return iterate(iter, perm_state)  # verworfen → nächster
+    zero_vec = zero(SVector{N, Float64})
+
+    if !(zero_vec ∈ hull)
+        # Gepruned → rekursiv mit nächstem Zustand (darf auch nothing sein)
+        return iterate(iter, new_perm_state)
     end
 
-    # Überlebt → Simplex zurückgeben
-    vertices = [iter.cache.lb .+ (SVector(idx.I...) .- 1) .* iter.cache.cell_width for idx in indices]
-    simplex = Simplex(tuple(vertices...), indices)
+    vertices = [
+        iter.cache.lb .+ (SVector{N}(idx.I .- 1) .* iter.cache.cell_width)
+        for idx in indices
+    ]
 
-    (simplex, perm_state)
+    simplex = Simplex{N}(vertices, indices)
+
+    return simplex, new_perm_state
 end

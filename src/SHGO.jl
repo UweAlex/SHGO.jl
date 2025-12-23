@@ -1,9 +1,11 @@
 module SHGO
 
+
 using StaticArrays
 using NonlinearOptimizationTestFunctions
 using SciMLBase
 using LinearAlgebra
+import NonlinearOptimizationTestFunctions: lb, ub
 
 # Alias
 const NOTF = NonlinearOptimizationTestFunctions

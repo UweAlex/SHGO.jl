@@ -11,8 +11,8 @@ struct VertexCache{N}
 end
 
 function VertexCache(tf::TestFunction, divisions::NTuple{N, Int}) where N
-    lb = SVector{N}(lb(tf))
-    ub = SVector{N}(ub(tf))
+    lb = SVector{N}(NonlinearOptimizationTestFunctions.lb(tf))
+    ub = SVector{N}(NonlinearOptimizationTestFunctions.ub(tf))
     cell_width = (ub - lb) ./ SVector{N}(divisions)
     VertexCache(
         Dict(),
