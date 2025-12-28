@@ -1,0 +1,17 @@
+# File: test/runtests.jl
+using Test, SHGO, NonlinearOptimizationTestFunctions, StaticArrays, LinearAlgebra, LazySets
+
+const NOTF = NonlinearOptimizationTestFunctions
+
+function create_test_cache(n=2, lb=(-5.0,-5.0), ub=(5.0,5.0), divisions=10)
+    tf = fixed(TEST_FUNCTIONS["sphere"]; n=n)
+    return VertexCache(tf, divisions; lb=SVector{n,Float64}(lb), ub=SVector{n,Float64}(ub))
+end
+
+@testset "SHGO.jl Full Suite" begin
+    include("test_pipeline.jl")
+    include("test_kuhn.jl")
+    include("shgogiar-test.jl")
+    include("test_core_components.jl")
+    include("test_multimodal_detection.jl")
+end

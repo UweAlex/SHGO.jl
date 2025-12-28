@@ -1,0 +1,86 @@
+# quick_shgo.jl
+# Stark vereinfachte SHGO-Implementierung
+# Alle Aufrufe sind zur Vermeidung von Namensraum-Konflikten voll qualifiziert.
+
+module QuickSHGO
+
+using StaticArrays
+using LinearAlgebra
+using Optimization
+using OptimizationOptimJL
+using NonlinearOptimizationTestFunctions
+
+export quick_shgo
+
+struct Vertex
+    pos::Base.Vector{Base.Float64}
+    val::Base.Float64
+end
+
+function quick_shgo(tf::NonlinearOptimizationTestFunctions.TestFunction; n_div=12, value_buffer=2.0, dist_tol=0.15)
+    # 1. Bounds abrufen
+    low = NonlinearOptimizationTestFunctions.lb(tf)
+    high = NonlinearOptimizationTestFunctions.ub(tf)
+    
+    # Schrittweite berechnen
+    step = (high .- low) ./ Base.Float64(n_div)
+    
+    # 2. Sampling: Gitter-Punkte generieren
+    points = QuickSHGO.Vertex[]
+    for i in 0:n_div
+        for j in 0:n_div
+            p_pos = [low[1] + i*step[1], low[2] + j*step[2]]
+            p_val = tf.f(p_pos)
+            Base.push!(points, QuickSHGO.Vertex(p_pos, p_val))
+        end
+    end
+    
+    # 3. Kandidaten: Filterung
+    f_min_sampled = Base.minimum(p.val for p in points)
+    candidates = Base.filter(p -> p.val <= f_min_sampled + value_buffer, points)
+    
+    # 4. Clustering (Einfacher Distanzcheck)
+    starts = QuickSHGO.Vertex[]
+    for c in candidates
+        if Base.all(LinearAlgebra.norm(c.pos .- s.pos) > dist_tol for s in starts)
+            Base.push!(starts, c)
+        end
+    end
+
+    # 5. Lokale Optimierung
+    # Verwendung von AutoForwardDiff zur Gradienten-Bereitstellung
+    opt_f = Optimization.OptimizationFunction((x, p) -> tf.f(x), Optimization.AutoForwardDiff())
+    
+    final_minima = []
+    for s in starts
+        prob = Optimization.OptimizationProblem(opt_f, s.pos; lb=low, ub=high)
+        # Lösung mittels LBFGS-Algorithmus
+        sol = Optimization.solve(prob, OptimizationOptimJL.LBFGS(); maxiters=200)
+        Base.push!(final_minima, (u=sol.u, f=sol.objective))
+    end
+
+    # Ergebnisse sortieren
+    return Base.sort(final_minima, by=x -> x.f)
+end
+
+end # module
+
+# --- Test-Skript ---
+# Wir prüfen explizit auf den Dateinamen, um Parse-Fehler durch @__FILE__ zu umgehen
+if Base.PROGRAM_FILE != "" && Base.endswith(Base.PROGRAM_FILE, "quickshgo.jl")
+    using .QuickSHGO
+    using NonlinearOptimizationTestFunctions
+    
+    tf = NonlinearOptimizationTestFunctions.fixed(NonlinearOptimizationTestFunctions.TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
+    
+    Base.println("Starte QuickSHGO (Voll qualifizierte Punktnotation)...")
+    results = QuickSHGO.quick_shgo(tf, n_div=15)
+
+    if !Base.isempty(results)
+        best = results[1]
+        Base.println("\n--- Ergebnis ---")
+        Base.println("Globales Minimum f ≈ ", Base.round(best.f, digits=6))
+        Base.println("Position x ≈ ", Base.round.(best.u, digits=4))
+        Base.println("Gefundene lokale Minima: ", Base.length(results))
+    end
+end

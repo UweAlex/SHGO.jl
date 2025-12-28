@@ -1,3 +1,4 @@
+# File: test\test_heaps_validation.jl
 #test/test_heaps_validation.jl
 using Test
 using SHGO
@@ -33,3 +34,4 @@ end
         @test perms1 == perms2
     end
 end
+# End: test\test_heaps_validation.jl

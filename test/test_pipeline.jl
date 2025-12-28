@@ -1,3 +1,4 @@
+# File: test\test_pipeline.jl
 using Test
 using SHGO
 using NonlinearOptimizationTestFunctions
@@ -33,3 +34,4 @@ using StaticArrays
         @test name(tf_himmel) == "himmelblau"
     end
 end
+# End: test\test_pipeline.jl

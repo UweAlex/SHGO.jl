@@ -25,4 +25,3 @@ for /r %%F in (*.jl, Project.toml, README.md, .gitignore) do (
 
 echo Fertig! Alle Dateien wurden in "%OUTPUT%" zusammengefasst.
 echo Du kannst diese Datei jetzt kopieren und in ein neues Chat-Fenster einfügen.
-pause
