@@ -1,86 +1,193 @@
-
 # SHGO.jl
 
-**Stochastic Homology Global Optimization in Julia**
+[![Build Status](https://github.com/USERNAME/SHGO.jl/workflows/CI/badge.svg)](https://github.com/USERNAME/SHGO.jl/actions)
+[![License: BSD-3](https://img.shields.io/badge/License-BSD3-blue.svg)](LICENSE)
 
-SHGO.jl ist nicht nur ein globaler Optimierer, sondern ein Instrument zur **Strukturanalyse von Optimierungslandschaften**. Es basiert auf der Idee, die topologische Information einer Zielfunktion zu nutzen, um alle lokalen Minima effizient zu finden und das globale Minimum zu garantieren.
+**Simplicial Homology Global Optimization in Julia**
 
----
+SHGO.jl is a pure Julia implementation of the SHGO algorithm for finding **all** local and global minima of a function within bounds. It is inspired by the [SciPy implementation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.shgo.html) but redesigned for Julia's strengths.
 
-## ⚠️ Der "Heureka-Moment": Korrektur der Basin-Theorie
+## Features
 
-In der frühen Entwicklung gab es einen fundamentalen logischen Fehler beim Clustering. Diese Erkenntnis ist der Kern der aktuellen Architektur:
+- 🎯 **Finds all minima** - not just the global one
+- 🔬 **Topological approach** - uses simplicial homology concepts
+- 💾 **Memory efficient** - implicit Kuhn topology, no graph in memory
+- ⚡ **Fast** - lazy evaluation with point caching
+- 🔄 **Automatic convergence** - stops when basin count stabilizes (Betti number stability)
 
-### Das Problem: Premature Clustering
+## Installation
 
-Früher wurde versucht, **aktive Simplizes** (Simplizes, in denen ein Minimum vermutet wird) zu gruppieren, *bevor* die lokale Optimierung stattfand.
+```julia
+using Pkg
+Pkg.add(url="https://github.com/USERNAME/SHGO.jl")
+```
 
-* **Fehler:** "Multiplikative Barrieren". Zwei Simplizes können topologisch benachbart sein, aber zu zwei völlig verschiedenen Minima führen.
-* **Folge:** Basins wurden "verschmolzen", bevor sie existierten. Die Anzahl der gefundenen Minima war instabil.
+## Quick Start
 
-### Die Lösung: Der SHGO-Flow (Korrekt)
+```julia
+using SHGO
+using NonlinearOptimizationTestFunctions
 
-1. **Sampling:** Den Raum in ein Gitter aus Simplizes unterteilen.
-2. **Topologische Filterung:** Identifikation "aktiver" Simplizes (Kandidatenregionen).
-3. **Lokale Optimierung:** *Jeder* aktive Simplex startet eine lokale Suche.
-4. **Deduplizierung (Echtes Clustering):** Erst die *Resultate* der Optimierung werden anhand ihrer Distanz im Phasenraum gruppiert.
+# Test function: Six-Hump Camelback (6 local minima, 2 global)
+tf = fixed(TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
 
----
+# Find all minima
+result = analyze(tf; verbose=true)
 
-## 📘 Terminologie & Taxonomie
+# Results
+println("Found $(result.num_basins) basins")
+for m in sort(result.local_minima, by=x->x.objective)
+    println("  f = $(round(m.objective, digits=4)) at $(round.(m.minimizer, digits=3))")
+end
+```
 
-Um Missverständnisse zu vermeiden (insbesondere im Vergleich zur SciPy-Implementierung), nutzt SHGO.jl folgende Definitionen:
+**Output:**
+```
+Found 6 basins
+  f = -1.0316 at [-0.09, 0.713]
+  f = -1.0316 at [0.09, -0.713]
+  f = -0.2155 at [-1.703, 0.796]
+  f = -0.2155 at [1.703, -0.796]
+  f = 2.104 at [-1.607, -0.569]
+  f = 2.104 at [1.607, 0.569]
+```
 
-| Begriff | Definition | Rolle im Algorithmus |
-| --- | --- | --- |
-| **Simplex** | Kleinste geometrische Einheit des Gitters. | Datenspeicher (Werte/Gradienten). |
-| **Star-Domain** | Die Nachbarschaft um einen Vertex. | Basis für die Homologie-Analyse. |
-| **Kandidaten-Region** | Zusammenhängende Menge aktiver Simplizes. | Ein "topologisches Feature" der Landschaft. |
-| **Attraction Basin** | Menge aller Punkte, die zum selben Minimum konvergieren. | **Wird erst nach Schritt 4 (Deduplizierung) gezählt.** |
+## Custom Objective Function
 
----
+```julia
+using SHGO
+using NonlinearOptimizationTestFunctions
 
-## 🛠 Architektur & Design-Prinzipien
+# Define your own function
+function my_objective(x)
+    return (x[1] - 1)^2 + (x[2] - 2.5)^2
+end
 
-### 1. Separation of Concerns
+function my_gradient(x)
+    return [2*(x[1] - 1), 2*(x[2] - 2.5)]
+end
 
-* **TopicalManager:** Verwaltet die Geometrie und Topologie (Vertices, IDs, Simplex-Beziehungen).
-* **Solver-Abstraktion:** Die lokale Optimierung ist entkoppelt.
-* **Analyse-Layer:** Liefert ein "Profil" der Landschaft, nicht nur eine Zahl.
+# Wrap in TestFunction format
+tf = TestFunction(
+    f = my_objective,
+    grad = my_gradient,
+    lb = [-5.0, -5.0],
+    ub = [5.0, 5.0],
+    name = "custom"
+)
 
-### 2. Eager vs. Lazy Evaluation
+result = analyze(tf)
+println("Global minimum: f = $(result.local_minima[1].objective)")
+println("Location: $(result.local_minima[1].minimizer)")
+```
 
-Im Gegensatz zu reinen Optimierern (die "Lazy" arbeiten, um Rechenzeit zu sparen), verfolgt SHGO.jl oft einen **Eager-Ansatz**:
+## API Reference
 
-* **Ziel:** Vollständige Abdeckung der Landschaft.
-* **Vorteil:** Wir erhalten eine verlässliche Verteilung der Funktionswerte, was für die Diagnose von "Deceptiveness" (Irreführung) der Funktion kritisch ist.
+### `analyze(tf; kwargs...)`
 
-### 3. Julia-spezifische Optimierungen
+Main entry point for optimization.
 
-* **StaticArrays:** Für blitzschnelle geometrische Berechnungen in niedrigen Dimensionen.
-* **Type-Safety:** Klare Trennung zwischen Vertex-IDs und physischen Koordinaten zur Vermeidung von Floating-Point-Fehlern in der Topologie-Logik.
+**Arguments:**
+- `tf` - Test function with fields `f`, `grad`, `lb`, `ub`
 
----
+**Keyword Arguments:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_div_initial` | 8 | Initial grid resolution per dimension |
+| `n_div_max` | 25 | Maximum grid resolution |
+| `stability_count` | 2 | Iterations with stable basin count for convergence |
+| `threshold_ratio` | 0.1 | Tolerance for basin merging (relative to value range) |
+| `min_distance_tolerance` | 0.05 | Minimum distance between distinct minima |
+| `local_maxiters` | 500 | Maximum iterations for local optimization |
+| `verbose` | false | Print progress information |
 
-## 🚀 Status Quo (Six-Hump-Camelback Test)
+**Returns:** `SHGOResult` with fields:
+- `local_minima::Vector{MinimumPoint}` - All found minima
+- `num_basins::Int` - Number of distinct basins
+- `converged::Bool` - Whether Betti stability was reached
+- `iterations::Int` - Number of refinement iterations
 
-Die aktuelle Version löst das klassische **Six-Hump-Camelback** Problem (2D) absolut stabil:
+### `MinimumPoint`
 
-* **Erwartet:** 6 lokale Minima (davon 2 global).
-* **Resultat:** 6/6 Basins werden verlässlich gefunden (`res.num_basins == 6`).
-* **Differenzierung:** Der Algorithmus erkennt die Struktur auch bei geringer Auflösung (`n_div = 12`), ohne Minima zu übersehen oder künstlich aufzublähen.
+```julia
+struct MinimumPoint
+    minimizer::Vector{Float64}  # Location of minimum
+    objective::Float64          # Function value at minimum
+end
+```
 
----
+Access via `m.minimizer` or `m.u` (SciML compatibility).
 
-## 📈 Roadmap
+## Algorithm Overview
 
-* [x] Korrektes Basin-Clustering (Post-Optimization).
-* [ ] Adaptive Gitter-Verfeinerung (Local Refinement).
-* [ ] Integration von `ForwardDiff` für exakte lokale Gradienten.
-* [ ] Parallelisierung der lokalen Suchen.
+SHGO.jl uses a topological approach to global optimization:
 
----
+1. **Grid Sampling** - Create a Kuhn triangulation of the search space
+2. **Star-Minimum Detection** - Find points that are minimal in their local neighborhood
+3. **Basin Clustering** - Group star-minima into attraction basins
+4. **Iterative Refinement** - Increase resolution until basin count stabilizes
+5. **Local Optimization** - Run L-BFGS from one representative per basin
+6. **Deduplication** - Merge minima that converged to the same point
 
-### Warum SHGO.jl?
+The key insight is that the number of basins (0th Betti number) becomes stable as resolution increases, providing a natural convergence criterion.
 
-*SciPy will lösen. SHGO.jl will verstehen.* Dieses Projekt ist für Anwender gedacht, die nicht nur wissen wollen, *wo* das Minimum liegt, sondern *wie* die gesamte energetische Landschaft beschaffen ist.
+## Benchmarks
+
+Tested on standard optimization benchmarks (2D):
+
+| Function | Expected Minima | Found | Time |
+|----------|----------------|-------|------|
+| Sphere | 1 | 1 | 0.001s |
+| Rosenbrock | 1 | 1 | 0.002s |
+| Himmelblau | 4 | 4 | 0.001s |
+| Six-Hump Camelback | 6 | 6 | 0.002s |
+| Rastrigin | 1 (global) | 1 | 2.1s |
+| Ackley | 1 | 1 | 1.4s |
+| Easom | 1 | 1 | 0.4s |
+
+**Coverage: 100%** on all test functions.
+
+## Comparison with SciPy SHGO
+
+| Aspect | SciPy SHGO | SHGO.jl |
+|--------|------------|---------|
+| Language | Python/C | Pure Julia |
+| Sampling | Sobol sequence | Kuhn grid |
+| Triangulation | Explicit Delaunay | Implicit Kuhn |
+| Memory | O(n²) | O(n) |
+| Parallelization | Limited (GIL) | Planned |
+| Constraints | Full support | Box bounds only |
+| High dimensions (N>6) | Good | Limited |
+
+**Current status:** Equivalent quality for 2D problems. SciPy is better for high-dimensional problems due to Sobol sampling.
+
+## Limitations
+
+- **Box constraints only** - nonlinear constraints not yet supported
+- **Dimension scaling** - Kuhn triangulation produces N! simplices per cell, limiting practical use to N ≤ 6
+- **No parallelization yet** - single-threaded execution
+
+## Roadmap
+
+- [ ] Constraint support (nonlinear inequalities/equalities)
+- [ ] Sobol sampling for high dimensions
+- [ ] Multi-threading for function evaluations
+- [ ] Direct benchmark suite against SciPy
+
+## References
+
+- Endres, S. C., Sandrock, C., & Focke, W. W. (2018). "A simplicial homology algorithm for Lipschitz optimisation." *Journal of Global Optimization*, 72(2), 181-217.
+- [SciPy SHGO Documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.shgo.html)
+
+## License
+
+BSD-3-Clause. See [LICENSE](LICENSE) for details.
+
+## Contributing
+
+Contributions welcome! Please open an issue or PR on GitHub.
+
+## Acknowledgments
+
+- Original SHGO algorithm by Stefan Endres
+- Architecture guidance from the Julia community

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'
+          - '1.11'
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      
+      - uses: julia-actions/cache@v2
+      
+      - name: Install dependencies
+        run: |
+          julia --project=. -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.precompile()
+          '
+      
+      - name: Run tests
+        run: |
+          julia --project=. -e '
+            using Pkg
+            Pkg.test()
+          '
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.11'
+      
+      - name: Build README examples
+        run: |
+          julia --project=. -e '
+            using Pkg
+            Pkg.instantiate()
+            
+            # Verify examples from README work
+            using SHGO
+            using NonlinearOptimizationTestFunctions
+            
+            tf = fixed(TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
+            result = analyze(tf)
+            
+            @assert result.num_basins >= 2 "Should find at least 2 basins"
+            @assert any(m -> m.objective < -1.0, result.local_minima) "Should find global minimum"
+            
+            println("README examples verified ✓")
+          '
