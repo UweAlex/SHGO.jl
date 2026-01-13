@@ -53,7 +53,9 @@ jobs:
       
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1.11'
+          version: '1'  # neueste stabile Julia-Version (zukunftssicher)
+      
+      - uses: julia-actions/cache@v2  # Cache auch hier nutzen
       
       - name: Build README examples
         run: |
@@ -61,15 +63,17 @@ jobs:
             using Pkg
             Pkg.instantiate()
             
-            # Verify examples from README work
             using SHGO
             using NonlinearOptimizationTestFunctions
             
             tf = fixed(TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
-            result = analyze(tf)
             
-            @assert result.num_basins >= 2 "Should find at least 2 basins"
-            @assert any(m -> m.objective < -1.0, result.local_minima) "Should find global minimum"
+            # Höhere Auflösung für zuverlässige Erkennung der globalen Minima
+            result = analyze(tf; n_div_initial=12, n_div_max=40)
+            
+            @assert result.num_basins >= 2 "Should find at least 2 basins (found $(result.num_basins))"
+            best_obj = minimum(m.objective for m in result.local_minima)
+            @assert best_obj ≤ -1.0 "Should find global minimum ≤ -1.0 (best found: $best_obj)"
             
             println("README examples verified ✓")
           '

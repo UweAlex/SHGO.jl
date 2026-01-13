@@ -1,5 +1,5 @@
 === SHGO.jl - Aktueller Code-Stand === 
-Generiert am 13.01.2026 um  6:20:27,94 
+Generiert am 13.01.2026 um  6:36:35,44 
  
 ------------------------Dateitrennzeichen--------------------------------------------- 
  
