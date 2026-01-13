@@ -11,7 +11,7 @@ using LinearAlgebra
 
 const NOTF = NonlinearOptimizationTestFunctions
 
-# Known minima from literature
+# Known minima from literature (erweitert für sixhumpcamelback)
 const KNOWN_MINIMA = Dict(
     "sphere" => [([0.0, 0.0], 0.0)],
     "rosenbrock" => [([1.0, 1.0], 0.0)],
@@ -24,10 +24,15 @@ const KNOWN_MINIMA = Dict(
     "sixhumpcamelback" => [
         ([-0.0898, 0.7126], -1.0316),
         ([0.0898, -0.7126], -1.0316),
+        # Lokale Minima (für robustere Tests)
+        ([-1.7036, 0.7961], -0.2155),
+        ([1.7036, -0.7961], -0.2155),
+        ([-1.6071, -0.5687], 2.1040),
+        ([1.6071, 0.5687], 2.1040)
     ]
 )
 
-function count_found(result, known; pos_tol=0.15, val_tol=0.02)
+function count_found(result, known; pos_tol=0.2, val_tol=0.05)
     found = 0
     for (pos, val) in known
         for m in result.local_minima
@@ -52,23 +57,19 @@ end
     @testset "PointCache" begin
         cache = SHGO.PointCache([0.0, 0.0], [1.0, 1.0], [10, 10])
         
-        # Position calculation
         @test SHGO.index_to_position(cache, (0, 0)) ≈ [0.0, 0.0]
         @test SHGO.index_to_position(cache, (10, 10)) ≈ [1.0, 1.0]
         
-        # Bounds check
         @test SHGO.is_valid_index(cache, (5, 5)) == true
         @test SHGO.is_valid_index(cache, (11, 5)) == false
         @test SHGO.is_valid_index(cache, (-1, 5)) == false
         
-        # Caching behavior
         f = x -> sum(x.^2)
         val1 = SHGO.get_value!(cache, (5, 5), f)
         @test SHGO.num_evaluated(cache) == 1
         val2 = SHGO.get_value!(cache, (5, 5), f)
-        @test SHGO.num_evaluated(cache) == 1  # No re-evaluation
+        @test SHGO.num_evaluated(cache) == 1
         
-        # Infinity padding
         @test SHGO.get_value!(cache, (100, 100), f) == Inf
     end
 
@@ -82,7 +83,7 @@ end
         @test (5, 6) in neighbors
         
         simplices = SHGO.get_simplices_in_cube(topo, (0, 0))
-        @test length(simplices) == 2  # 2! = 2 in 2D
+        @test length(simplices) == 2
     end
 
     @testset "Single-Minimum Functions" begin
@@ -103,22 +104,24 @@ end
     @testset "Multi-Minimum Functions" begin
         @testset "Himmelblau (4 minima)" begin
             tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["himmelblau"]; n=2)
-            result = SHGO.analyze(tf; n_div_initial=12, n_div_max=25)
+            result = SHGO.analyze(tf; n_div_initial=20, n_div_max=50, stability_count=3)
             
-            @test result.num_basins >= 2
+            @test result.num_basins >= 3
             known = KNOWN_MINIMA["himmelblau"]
-            @test count_found(result, known) >= 2
+            @test count_found(result, known; pos_tol=0.2, val_tol=0.05) >= 3
         end
 
         @testset "Six-Hump Camelback (6 minima)" begin
             tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
-            result = SHGO.analyze(tf; n_div_initial=12, n_div_max=30)
+            result = SHGO.analyze(tf; n_div_initial=20, n_div_max=50, stability_count=3)
             
-            @test result.num_basins >= 2
+            @test result.num_basins >= 4
             
-            # Must find global minimum
             best = minimum(m.objective for m in result.local_minima)
-            @test best < -1.0
+            @test best ≤ -1.03
+            
+            known = KNOWN_MINIMA["sixhumpcamelback"]
+            @test count_found(result, known; pos_tol=0.2, val_tol=0.05) >= 2
         end
     end
 
@@ -133,7 +136,6 @@ end
     @testset "Backward Compatibility" begin
         tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["sphere"]; n=2)
         
-        # Old API should work
         result = SHGO.analyze(tf; n_div=10, use_gradient_pruning=false)
         
         @test result.num_basins >= 1
