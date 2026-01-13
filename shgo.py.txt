@@ -1,0 +1,3315 @@
+"""shgo: The simplicial homology global optimisation algorithm."""
+from collections import namedtuple
+import time
+import logging
+import warnings
+import sys
+
+import numpy as np
+
+from scipy import spatial
+from scipy.optimize import OptimizeResult, minimize, Bounds
+from scipy.optimize._optimize import MemoizeJac
+from scipy.optimize._constraints import new_bounds_to_old
+from scipy.optimize._minimize import standardize_constraints
+from scipy._lib._util import _FunctionWrapper
+
+from scipy.optimize._shgo_lib._complex import Complex
+
+__all__ = ['shgo']
+
+
+def shgo(
+    func, bounds, args=(), constraints=None, n=100, iters=1, callback=None,
+    minimizer_kwargs=None, options=None, sampling_method='simplicial', *,
+    workers=1
+):
+    """
+    Finds the global minimum of a function using SHG optimization.
+
+    SHGO stands for "simplicial homology global optimization".
+
+    Parameters
+    ----------
+    func : callable
+        The objective function to be minimized.  Must be in the form
+        ``f(x, *args)``, where ``x`` is the argument in the form of a 1-D array
+        and ``args`` is a tuple of any additional fixed parameters needed to
+        completely specify the function.
+    bounds : sequence or `Bounds`
+        Bounds for variables. There are two ways to specify the bounds:
+
+        1. Instance of `Bounds` class.
+        2. Sequence of ``(min, max)`` pairs for each element in `x`.
+
+    args : tuple, optional
+        Any additional fixed parameters needed to completely specify the
+        objective function.
+    constraints : {Constraint, dict} or List of {Constraint, dict}, optional
+        Constraints definition. Only for COBYLA, COBYQA, SLSQP and trust-constr.
+        See the tutorial [5]_ for further details on specifying constraints.
+
+        .. note::
+
+           Only COBYLA, COBYQA, SLSQP, and trust-constr local minimize methods
+           currently support constraint arguments. If the ``constraints``
+           sequence used in the local optimization problem is not defined in
+           ``minimizer_kwargs`` and a constrained method is used then the
+           global ``constraints`` will be used.
+           (Defining a ``constraints`` sequence in ``minimizer_kwargs``
+           means that ``constraints`` will not be added so if equality
+           constraints and so forth need to be added then the inequality
+           functions in ``constraints`` need to be added to
+           ``minimizer_kwargs`` too).
+           COBYLA only supports inequality constraints.
+
+        .. versionchanged:: 1.11.0
+
+           ``constraints`` accepts `NonlinearConstraint`, `LinearConstraint`.
+
+    n : int, optional
+        Number of sampling points used in the construction of the simplicial
+        complex. For the default ``simplicial`` sampling method 2**dim + 1
+        sampling points are generated instead of the default ``n=100``. For all
+        other specified values `n` sampling points are generated. For
+        ``sobol``, ``halton`` and other arbitrary `sampling_methods` ``n=100`` or
+        another specified number of sampling points are generated.
+    iters : int, optional
+        Number of iterations used in the construction of the simplicial
+        complex. Default is 1.
+    callback : callable, optional
+        Called after each iteration, as ``callback(xk)``, where ``xk`` is the
+        current parameter vector.
+    minimizer_kwargs : dict, optional
+        Extra keyword arguments to be passed to the minimizer
+        ``scipy.optimize.minimize``. Some important options could be:
+
+        method : str
+            The minimization method. If not given, chosen to be one of
+            BFGS, L-BFGS-B, SLSQP, depending on whether or not the
+            problem has constraints or bounds.
+        args : tuple
+            Extra arguments passed to the objective function (``func``) and
+            its derivatives (Jacobian, Hessian).
+        options : dict, optional
+            Note that by default the tolerance is specified as
+            ``{ftol: 1e-12}``
+
+    options : dict, optional
+        A dictionary of solver options. Many of the options specified for the
+        global routine are also passed to the ``scipy.optimize.minimize``
+        routine. The options that are also passed to the local routine are
+        marked with "(L)".
+
+        Stopping criteria, the algorithm will terminate if any of the specified
+        criteria are met. However, the default algorithm does not require any
+        to be specified:
+
+        maxfev : int (L)
+            Maximum number of function evaluations in the feasible domain.
+            (Note only methods that support this option will terminate
+            the routine at precisely exact specified value. Otherwise the
+            criterion will only terminate during a global iteration)
+        f_min : float
+            Specify the minimum objective function value, if it is known.
+        f_tol : float
+            Precision goal for the value of f in the stopping
+            criterion. Note that the global routine will also
+            terminate if a sampling point in the global routine is
+            within this tolerance.
+        maxiter : int
+            Maximum number of iterations to perform.
+        maxev : int
+            Maximum number of sampling evaluations to perform (includes
+            searching in infeasible points).
+        maxtime : float
+            Maximum processing runtime allowed
+        minhgrd : int
+            Minimum homology group rank differential. The homology group of the
+            objective function is calculated (approximately) during every
+            iteration. The rank of this group has a one-to-one correspondence
+            with the number of locally convex subdomains in the objective
+            function (after adequate sampling points each of these subdomains
+            contain a unique global minimum). If the difference in the hgr is 0
+            between iterations for ``maxhgrd`` specified iterations the
+            algorithm will terminate.
+
+        Objective function knowledge:
+
+        symmetry : list or bool
+            Specify if the objective function contains symmetric variables.
+            The search space (and therefore performance) is decreased by up to
+            O(n!) times in the fully symmetric case. If `True` is specified
+            then all variables will be set symmetric to the first variable.
+            Default
+            is set to False.
+
+            E.g.  f(x) = (x_1 + x_2 + x_3) + (x_4)**2 + (x_5)**2 + (x_6)**2
+
+            In this equation x_2 and x_3 are symmetric to x_1, while x_5 and
+            x_6 are symmetric to x_4, this can be specified to the solver as::
+
+                symmetry = [0,  # Variable 1
+                            0,  # symmetric to variable 1
+                            0,  # symmetric to variable 1
+                            3,  # Variable 4
+                            3,  # symmetric to variable 4
+                            3,  # symmetric to variable 4
+                            ]
+
+        jac : bool or callable, optional
+            Jacobian (gradient) of objective function. Only for CG, BFGS,
+            Newton-CG, L-BFGS-B, TNC, SLSQP, dogleg, trust-ncg. If ``jac`` is a
+            boolean and is True, ``fun`` is assumed to return the gradient
+            along with the objective function. If False, the gradient will be
+            estimated numerically. ``jac`` can also be a callable returning the
+            gradient of the objective. In this case, it must accept the same
+            arguments as ``fun``. (Passed to `scipy.optimize.minimize`
+            automatically)
+
+        hess, hessp : callable, optional
+            Hessian (matrix of second-order derivatives) of objective function
+            or Hessian of objective function times an arbitrary vector p.
+            Only for Newton-CG, dogleg, trust-ncg. Only one of ``hessp`` or
+            ``hess`` needs to be given. If ``hess`` is provided, then
+            ``hessp`` will be ignored. If neither ``hess`` nor ``hessp`` is
+            provided, then the Hessian product will be approximated using
+            finite differences on ``jac``. ``hessp`` must compute the Hessian
+            times an arbitrary vector. (Passed to `scipy.optimize.minimize`
+            automatically)
+
+        Algorithm settings:
+
+        minimize_every_iter : bool
+            If True then promising global sampling points will be passed to a
+            local minimization routine every iteration. If False then only the
+            final minimizer pool will be run. Defaults to True.
+
+        local_iter : int
+            Only evaluate a few of the best minimizer pool candidates every
+            iteration. If False all potential points are passed to the local
+            minimization routine.
+
+        infty_constraints : bool
+            If True then any sampling points generated which are outside will
+            the feasible domain will be saved and given an objective function
+            value of ``inf``. If False then these points will be discarded.
+            Using this functionality could lead to higher performance with
+            respect to function evaluations before the global minimum is found,
+            specifying False will use less memory at the cost of a slight
+            decrease in performance. Defaults to True.
+
+        Feedback:
+
+        disp : bool (L)
+            Set to True to print convergence messages.
+
+    sampling_method : str or function, optional
+        Current built in sampling method options are ``halton``, ``sobol`` and
+        ``simplicial``. The default ``simplicial`` provides
+        the theoretical guarantee of convergence to the global minimum in
+        finite time. ``halton`` and ``sobol`` method are faster in terms of
+        sampling point generation at the cost of the loss of
+        guaranteed convergence. It is more appropriate for most "easier"
+        problems where the convergence is relatively fast.
+        User defined sampling functions must accept two arguments of ``n``
+        sampling points of dimension ``dim`` per call and output an array of
+        sampling points with shape `n x dim`.
+
+    workers : int or map-like callable, optional
+        Sample and run the local serial minimizations in parallel.
+        Supply -1 to use all available CPU cores, or an int to use
+        that many Processes (uses `multiprocessing.Pool <multiprocessing>`).
+
+        Alternatively supply a map-like callable, such as
+        `multiprocessing.Pool.map` for parallel evaluation.
+        This evaluation is carried out as ``workers(func, iterable)``.
+        Requires that `func` be pickleable.
+
+        .. versionadded:: 1.11.0
+
+    Returns
+    -------
+    res : OptimizeResult
+        The optimization result represented as a `OptimizeResult` object.
+        Important attributes are:
+        ``x`` the solution array corresponding to the global minimum,
+        ``fun`` the function output at the global solution,
+        ``xl`` an ordered list of local minima solutions,
+        ``funl`` the function output at the corresponding local solutions,
+        ``success`` a Boolean flag indicating if the optimizer exited
+        successfully,
+        ``message`` which describes the cause of the termination,
+        ``nfev`` the total number of objective function evaluations including
+        the sampling calls,
+        ``nlfev`` the total number of objective function evaluations
+        culminating from all local search optimizations,
+        ``nit`` number of iterations performed by the global routine.
+
+    Notes
+    -----
+    Global optimization using simplicial homology global optimization [1]_.
+    Appropriate for solving general purpose NLP and blackbox optimization
+    problems to global optimality (low-dimensional problems).
+
+    In general, the optimization problems are of the form::
+
+        minimize f(x) subject to
+
+        g_i(x) >= 0,  i = 1,...,m
+        h_j(x)  = 0,  j = 1,...,p
+
+    where x is a vector of one or more variables. ``f(x)`` is the objective
+    function ``R^n -> R``, ``g_i(x)`` are the inequality constraints, and
+    ``h_j(x)`` are the equality constraints.
+
+    Optionally, the lower and upper bounds for each element in x can also be
+    specified using the `bounds` argument.
+
+    While most of the theoretical advantages of SHGO are only proven for when
+    ``f(x)`` is a Lipschitz smooth function, the algorithm is also proven to
+    converge to the global optimum for the more general case where ``f(x)`` is
+    non-continuous, non-convex and non-smooth, if the default sampling method
+    is used [1]_.
+
+    The local search method may be specified using the ``minimizer_kwargs``
+    parameter which is passed on to ``scipy.optimize.minimize``. By default,
+    the ``SLSQP`` method is used. In general, it is recommended to use the
+    ``SLSQP``, ``COBYLA``, or ``COBYQA`` local minimization if inequality
+    constraints are defined for the problem since the other methods do not use
+    constraints.
+
+    The ``halton`` and ``sobol`` method points are generated using
+    `scipy.stats.qmc`. Any other QMC method could be used.
+
+    References
+    ----------
+    .. [1] Endres, SC, Sandrock, C, Focke, WW (2018) "A simplicial homology
+           algorithm for lipschitz optimisation", Journal of Global
+           Optimization.
+    .. [2] Joe, SW and Kuo, FY (2008) "Constructing Sobol' sequences with
+           better  two-dimensional projections", SIAM J. Sci. Comput. 30,
+           2635-2654.
+    .. [3] Hock, W and Schittkowski, K (1981) "Test examples for nonlinear
+           programming codes", Lecture Notes in Economics and Mathematical
+           Systems, 187. Springer-Verlag, New York.
+           http://www.ai7.uni-bayreuth.de/test_problem_coll.pdf
+    .. [4] Wales, DJ (2015) "Perspective: Insight into reaction coordinates and
+           dynamics from the potential energy landscape",
+           Journal of Chemical Physics, 142(13), 2015.
+    .. [5] https://docs.scipy.org/doc/scipy/tutorial/optimize.html#constrained-minimization-of-multivariate-scalar-functions-minimize
+
+    Examples
+    --------
+    First consider the problem of minimizing the Rosenbrock function, `rosen`:
+
+    >>> from scipy.optimize import rosen, shgo
+    >>> bounds = [(0,2), (0, 2), (0, 2), (0, 2), (0, 2)]
+    >>> result = shgo(rosen, bounds)
+    >>> result.x, result.fun
+    (array([1., 1., 1., 1., 1.]), 2.920392374190081e-18)
+
+    Note that bounds determine the dimensionality of the objective
+    function and is therefore a required input, however you can specify
+    empty bounds using ``None`` or objects like ``np.inf`` which will be
+    converted to large float numbers.
+
+    >>> bounds = [(None, None), ]*4
+    >>> result = shgo(rosen, bounds)
+    >>> result.x
+    array([0.99999851, 0.99999704, 0.99999411, 0.9999882 ])
+
+    Next, we consider the Eggholder function, a problem with several local
+    minima and one global minimum. We will demonstrate the use of arguments and
+    the capabilities of `shgo`.
+    (https://en.wikipedia.org/wiki/Test_functions_for_optimization)
+
+    >>> import numpy as np
+    >>> def eggholder(x):
+    ...     return (-(x[1] + 47.0)
+    ...             * np.sin(np.sqrt(abs(x[0]/2.0 + (x[1] + 47.0))))
+    ...             - x[0] * np.sin(np.sqrt(abs(x[0] - (x[1] + 47.0))))
+    ...             )
+    ...
+    >>> bounds = [(-512, 512), (-512, 512)]
+
+    `shgo` has built-in low discrepancy sampling sequences. First, we will
+    input 64 initial sampling points of the *Sobol'* sequence:
+
+    >>> result = shgo(eggholder, bounds, n=64, sampling_method='sobol')
+    >>> result.x, result.fun
+    (array([512.        , 404.23180824]), -959.6406627208397)
+
+    `shgo` also has a return for any other local minima that was found, these
+    can be called using:
+
+    >>> result.xl
+    array([[ 512.        ,  404.23180824],
+           [ 283.0759062 , -487.12565635],
+           [-294.66820039, -462.01964031],
+           [-105.87688911,  423.15323845],
+           [-242.97926   ,  274.38030925],
+           [-506.25823477,    6.3131022 ],
+           [-408.71980731, -156.10116949],
+           [ 150.23207937,  301.31376595],
+           [  91.00920901, -391.283763  ],
+           [ 202.89662724, -269.38043241],
+           [ 361.66623976, -106.96493868],
+           [-219.40612786, -244.06020508]])
+
+    >>> result.funl
+    array([-959.64066272, -718.16745962, -704.80659592, -565.99778097,
+           -559.78685655, -557.36868733, -507.87385942, -493.9605115 ,
+           -426.48799655, -421.15571437, -419.31194957, -410.98477763])
+
+    These results are useful in applications where there are many global minima
+    and the values of other global minima are desired or where the local minima
+    can provide insight into the system (for example morphologies
+    in physical chemistry [4]_).
+
+    If we want to find a larger number of local minima, we can increase the
+    number of sampling points or the number of iterations. We'll increase the
+    number of sampling points to 64 and the number of iterations from the
+    default of 1 to 3. Using ``simplicial`` this would have given us
+    64 x 3 = 192 initial sampling points.
+
+    >>> result_2 = shgo(eggholder,
+    ...                 bounds, n=64, iters=3, sampling_method='sobol')
+    >>> len(result.xl), len(result_2.xl)
+    (12, 23)
+
+    Note the difference between, e.g., ``n=192, iters=1`` and ``n=64,
+    iters=3``.
+    In the first case the promising points contained in the minimiser pool
+    are processed only once. In the latter case it is processed every 64
+    sampling points for a total of 3 times.
+
+    To demonstrate solving problems with non-linear constraints consider the
+    following example from Hock and Schittkowski problem 73 (cattle-feed)
+    [3]_::
+
+        minimize: f = 24.55 * x_1 + 26.75 * x_2 + 39 * x_3 + 40.50 * x_4
+
+        subject to: 2.3 * x_1 + 5.6 * x_2 + 11.1 * x_3 + 1.3 * x_4 - 5    >= 0,
+
+                    12 * x_1 + 11.9 * x_2 + 41.8 * x_3 + 52.1 * x_4 - 21
+                        -1.645 * sqrt(0.28 * x_1**2 + 0.19 * x_2**2 +
+                                      20.5 * x_3**2 + 0.62 * x_4**2)      >= 0,
+
+                    x_1 + x_2 + x_3 + x_4 - 1                             == 0,
+
+                    1 >= x_i >= 0 for all i
+
+    The approximate answer given in [3]_ is::
+
+        f([0.6355216, -0.12e-11, 0.3127019, 0.05177655]) = 29.894378
+
+    >>> def f(x):  # (cattle-feed)
+    ...     return 24.55*x[0] + 26.75*x[1] + 39*x[2] + 40.50*x[3]
+    ...
+    >>> def g1(x):
+    ...     return 2.3*x[0] + 5.6*x[1] + 11.1*x[2] + 1.3*x[3] - 5  # >=0
+    ...
+    >>> def g2(x):
+    ...     return (12*x[0] + 11.9*x[1] +41.8*x[2] + 52.1*x[3] - 21
+    ...             - 1.645 * np.sqrt(0.28*x[0]**2 + 0.19*x[1]**2
+    ...                             + 20.5*x[2]**2 + 0.62*x[3]**2)
+    ...             ) # >=0
+    ...
+    >>> def h1(x):
+    ...     return x[0] + x[1] + x[2] + x[3] - 1  # == 0
+    ...
+    >>> cons = ({'type': 'ineq', 'fun': g1},
+    ...         {'type': 'ineq', 'fun': g2},
+    ...         {'type': 'eq', 'fun': h1})
+    >>> bounds = [(0, 1.0),]*4
+    >>> res = shgo(f, bounds, n=150, constraints=cons)
+    >>> res
+     message: Optimization terminated successfully.
+     success: True
+         fun: 29.894378159142136
+        funl: [ 2.989e+01]
+           x: [ 6.355e-01  1.137e-13  3.127e-01  5.178e-02] # may vary
+          xl: [[ 6.355e-01  1.137e-13  3.127e-01  5.178e-02]] # may vary
+         nit: 1
+        nfev: 142 # may vary
+       nlfev: 35 # may vary
+       nljev: 5
+       nlhev: 0
+
+    >>> g1(res.x), g2(res.x), h1(res.x)
+    (-5.062616992290714e-14, -2.9594104944408173e-12, 0.0)
+
+    """
+    # if necessary, convert bounds class to old bounds
+    if isinstance(bounds, Bounds):
+        bounds = new_bounds_to_old(bounds.lb, bounds.ub, len(bounds.lb))
+
+    # Initiate SHGO class
+    # use in context manager to make sure that any parallelization
+    # resources are freed.
+    with SHGO(func, bounds, args=args, constraints=constraints, n=n,
+               iters=iters, callback=callback,
+               minimizer_kwargs=minimizer_kwargs,
+               options=options, sampling_method=sampling_method,
+               workers=workers) as shc:
+        # Run the algorithm, process results and test success
+        shc.iterate_all()
+
+    if not shc.break_routine:
+        if shc.disp:
+            logging.info("Successfully completed construction of complex.")
+
+    # Test post iterations success
+    if len(shc.LMC.xl_maps) == 0:
+        # If sampling failed to find pool, return lowest sampled point
+        # with a warning
+        shc.find_lowest_vertex()
+        shc.break_routine = True
+        shc.fail_routine(mes="Failed to find a feasible minimizer point. "
+                             f"Lowest sampling point = {shc.f_lowest}")
+        shc.res.fun = shc.f_lowest
+        shc.res.x = shc.x_lowest
+        shc.res.nfev = shc.fn
+        shc.res.tnev = shc.n_sampled
+    else:
+        # Test that the optimal solutions do not violate any constraints
+        pass  # TODO
+
+    # Confirm the routine ran successfully
+    if not shc.break_routine:
+        shc.res.message = 'Optimization terminated successfully.'
+        shc.res.success = True
+
+    # Return the final results
+    return shc.res
+
+
+class SHGO:
+    def __init__(self, func, bounds, args=(), constraints=None, n=None,
+                 iters=None, callback=None, minimizer_kwargs=None,
+                 options=None, sampling_method='simplicial', workers=1):
+        from scipy.stats import qmc
+        # Input checks
+        methods = ['halton', 'sobol', 'simplicial']
+        if isinstance(sampling_method, str) and sampling_method not in methods:
+            raise ValueError(("Unknown sampling_method specified."
+                              " Valid methods: {}").format(', '.join(methods)))
+
+        # copy the options dictionaries so that the user input is not mutated
+        if minimizer_kwargs is not None and isinstance(minimizer_kwargs, dict):
+            minimizer_kwargs = minimizer_kwargs.copy()
+        if options is not None and isinstance(options, dict):
+            options = options.copy()
+
+        if options is not None and options.get('jac', None) is True:
+            if minimizer_kwargs is None:
+                minimizer_kwargs = {}
+            minimizer_kwargs['jac'] = True
+            options.pop('jac')
+
+        # Split obj func if given with Jac
+        try:
+            if ((minimizer_kwargs['jac'] is True) and
+                    (not callable(minimizer_kwargs['jac']))):
+                self.func = MemoizeJac(func)
+                jac = self.func.derivative
+                minimizer_kwargs['jac'] = jac
+                func = self.func  # fun
+            else:
+                self.func = func  # Normal definition of objective function
+        except (TypeError, KeyError):
+            self.func = func  # Normal definition of objective function
+
+        # Initiate class
+        self.func = _FunctionWrapper(func, args)
+        self.bounds = bounds
+        self.args = args
+        self.callback = callback
+
+        # Bounds
+        abound = np.array(bounds, float)
+        self.dim = np.shape(abound)[0]  # Dimensionality of problem
+
+        # Set none finite values to large floats
+        infind = ~np.isfinite(abound)
+        abound[infind[:, 0], 0] = -1e50
+        abound[infind[:, 1], 1] = 1e50
+
+        # Check if bounds are correctly specified
+        bnderr = abound[:, 0] > abound[:, 1]
+        if bnderr.any():
+            raise ValueError("Error: lb > ub in bounds "
+                             f"{', '.join(str(b) for b in bnderr)}.")
+
+        self.bounds = abound
+
+        # Constraints
+        # Process constraint dict sequence:
+        self.constraints = constraints
+        if constraints is not None:
+            self.min_cons = constraints
+            self.g_cons = []
+            self.g_args = []
+
+            # shgo internals deals with old-style constraints
+            # self.constraints is used to create Complex, so need
+            # to be stored internally in old-style.
+            # `minimize` takes care of normalising these constraints
+            # for slsqp/cobyla/cobyqa/trust-constr.
+            self.constraints = standardize_constraints(
+                constraints,
+                np.empty(self.dim, float),
+                'old'
+            )
+            for cons in self.constraints:
+                if cons['type'] in ('ineq'):
+                    self.g_cons.append(cons['fun'])
+                    try:
+                        self.g_args.append(cons['args'])
+                    except KeyError:
+                        self.g_args.append(())
+            self.g_cons = tuple(self.g_cons)
+            self.g_args = tuple(self.g_args)
+        else:
+            self.g_cons = None
+            self.g_args = None
+
+        # Define local minimization keyword arguments
+        # Start with defaults
+        self.minimizer_kwargs = {'method': 'SLSQP',
+                                 'bounds': self.bounds,
+                                 'options': {},
+                                 'callback': self.callback
+                                 }
+        if minimizer_kwargs is not None:
+            # Overwrite with supplied values
+            self.minimizer_kwargs.update(minimizer_kwargs)
+
+        else:
+            self.minimizer_kwargs['options'] = {'ftol': 1e-12}
+
+        if (
+            self.minimizer_kwargs['method'].lower() in ('slsqp', 'cobyla',
+                                                        'cobyqa',
+                                                        'trust-constr')
+            and (
+                minimizer_kwargs is not None and
+                'constraints' not in minimizer_kwargs and
+                constraints is not None
+            ) or
+            (self.g_cons is not None)
+        ):
+            self.minimizer_kwargs['constraints'] = self.min_cons
+
+        # Process options dict
+        if options is not None:
+            self.init_options(options)
+        else:  # Default settings:
+            self.f_min_true = None
+            self.minimize_every_iter = True
+
+            # Algorithm limits
+            self.maxiter = None
+            self.maxfev = None
+            self.maxev = None
+            self.maxtime = None
+            self.f_min_true = None
+            self.minhgrd = None
+
+            # Objective function knowledge
+            self.symmetry = None
+
+            # Algorithm functionality
+            self.infty_cons_sampl = True
+            self.local_iter = False
+
+            # Feedback
+            self.disp = False
+
+        # normalize grad + hess calls for args
+        # this has to be done after minimizer_kwargs has finished having its
+        # jac/hess/args edited.
+        _grad = self.minimizer_kwargs.get('jac', None)
+        if callable(_grad):
+            self.minimizer_kwargs['jac'] = _FunctionWrapper(_grad, self.args)
+        _hess = self.minimizer_kwargs.get('hess', None)
+        if callable(_hess):
+            self.minimizer_kwargs['hess'] = _FunctionWrapper(_hess, self.args)
+
+        # we've already wrapped fun, grad, hess, so no need for args
+        self.minimizer_kwargs.pop("args", None)
+        self.minimizer_kwargs["options"].pop("args", None)
+
+        # Remove unknown arguments in self.minimizer_kwargs
+        # Start with arguments all the solvers have in common
+        self.min_solver_args = ['fun', 'x0', 'args',
+                                'callback', 'options', 'method']
+        # then add the ones unique to specific solvers
+        solver_args = {
+            '_custom': ['jac', 'hess', 'hessp', 'bounds', 'constraints'],
+            'nelder-mead': [],
+            'powell': [],
+            'cg': ['jac'],
+            'bfgs': ['jac'],
+            'newton-cg': ['jac', 'hess', 'hessp'],
+            'l-bfgs-b': ['jac', 'bounds'],
+            'tnc': ['jac', 'bounds'],
+            'cobyla': ['constraints', 'catol'],
+            'cobyqa': ['bounds', 'constraints', 'feasibility_tol'],
+            'slsqp': ['jac', 'bounds', 'constraints'],
+            'dogleg': ['jac', 'hess'],
+            'trust-ncg': ['jac', 'hess', 'hessp'],
+            'trust-krylov': ['jac', 'hess', 'hessp'],
+            'trust-exact': ['jac', 'hess'],
+            'trust-constr': ['jac', 'hess', 'hessp', 'constraints'],
+        }
+        method = self.minimizer_kwargs['method']
+        self.min_solver_args += solver_args[method.lower()]
+
+        # Only retain the known arguments
+        def _restrict_to_keys(dictionary, goodkeys):
+            """Remove keys from dictionary if not in goodkeys - inplace"""
+            existingkeys = set(dictionary)
+            for key in existingkeys - set(goodkeys):
+                dictionary.pop(key, None)
+
+        _restrict_to_keys(self.minimizer_kwargs, self.min_solver_args)
+        _restrict_to_keys(self.minimizer_kwargs['options'],
+                          self.min_solver_args + ['ftol'])
+
+        # Algorithm controls
+        # Global controls
+        self.stop_global = False  # Used in the stopping_criteria method
+        self.break_routine = False  # Break the algorithm globally
+        self.iters = iters  # Iterations to be ran
+        self.iters_done = 0  # Iterations completed
+        self.n = n  # Sampling points per iteration
+        self.nc = 0  # n  # Sampling points to sample in current iteration
+        self.n_prc = 0  # Processed points (used to track Delaunay iters)
+        self.n_sampled = 0  # To track no. of sampling points already generated
+        self.fn = 0  # Number of feasible sampling points evaluations performed
+        self.hgr = 0  # Homology group rank
+        # Initially attempt to build the triangulation incrementally:
+        self.qhull_incremental = True
+
+        # Default settings if no sampling criteria.
+        if (self.n is None) and (self.iters is None) \
+                and (sampling_method == 'simplicial'):
+            self.n = 2 ** self.dim + 1
+            self.nc = 0  # self.n
+        if self.iters is None:
+            self.iters = 1
+        if (self.n is None) and not (sampling_method == 'simplicial'):
+            self.n = self.n = 100
+            self.nc = 0  # self.n
+        if (self.n == 100) and (sampling_method == 'simplicial'):
+            self.n = 2 ** self.dim + 1
+
+        if not ((self.maxiter is None) and (self.maxfev is None) and (
+                self.maxev is None)
+                and (self.minhgrd is None) and (self.f_min_true is None)):
+            self.iters = None
+
+        # Set complex construction mode based on a provided stopping criteria:
+        # Initialise sampling Complex and function cache
+        # Note that sfield_args=() since args are already wrapped in self.func
+        # using the_FunctionWrapper class.
+        self.HC = Complex(dim=self.dim, domain=self.bounds,
+                          sfield=self.func, sfield_args=(),
+                          symmetry=self.symmetry,
+                          constraints=self.constraints,
+                          workers=workers)
+
+        # Choose complex constructor
+        if sampling_method == 'simplicial':
+            self.iterate_complex = self.iterate_hypercube
+            self.sampling_method = sampling_method
+
+        elif sampling_method in ['halton', 'sobol'] or \
+                not isinstance(sampling_method, str):
+            self.iterate_complex = self.iterate_delaunay
+            # Sampling method used
+            if sampling_method in ['halton', 'sobol']:
+                if sampling_method == 'sobol':
+                    self.n = int(2 ** np.ceil(np.log2(self.n)))
+                    # self.n #TODO: Should always be self.n, this is
+                    # unacceptable for shgo, check that nfev behaves as
+                    # expected.
+                    self.nc = 0
+                    self.sampling_method = 'sobol'
+                    self.qmc_engine = qmc.Sobol(d=self.dim, scramble=False,
+                                                seed=0)
+                else:
+                    self.sampling_method = 'halton'
+                    self.qmc_engine = qmc.Halton(d=self.dim, scramble=True,
+                                                 seed=0)
+
+                def sampling_method(n, d):
+                    return self.qmc_engine.random(n)
+
+            else:
+                # A user defined sampling method:
+                self.sampling_method = 'custom'
+
+            self.sampling = self.sampling_custom
+            self.sampling_function = sampling_method  # F(n, d)
+
+        # Local controls
+        self.stop_l_iter = False  # Local minimisation iterations
+        self.stop_complex_iter = False  # Sampling iterations
+
+        # Initiate storage objects used in algorithm classes
+        self.minimizer_pool = []
+
+        # Cache of local minimizers mapped
+        self.LMC = LMapCache()
+
+        # Initialize return object
+        self.res = OptimizeResult()  # scipy.optimize.OptimizeResult object
+        self.res.nfev = 0  # Includes each sampling point as func evaluation
+        self.res.nlfev = 0  # Local function evals for all minimisers
+        self.res.nljev = 0  # Local Jacobian evals for all minimisers
+        self.res.nlhev = 0  # Local Hessian evals for all minimisers
+
+    # Initiation aids
+    def init_options(self, options):
+        """
+        Initiates the options.
+
+        Can also be useful to change parameters after class initiation.
+
+        Parameters
+        ----------
+        options : dict
+
+        Returns
+        -------
+        None
+
+        """
+        # Update 'options' dict passed to optimize.minimize
+        # Do this first so we don't mutate `options` below.
+        self.minimizer_kwargs['options'].update(options)
+
+        # Ensure that 'jac', 'hess', and 'hessp' are passed directly to
+        # `minimize` as keywords, not as part of its 'options' dictionary.
+        for opt in ['jac', 'hess', 'hessp']:
+            if opt in self.minimizer_kwargs['options']:
+                self.minimizer_kwargs[opt] = (
+                    self.minimizer_kwargs['options'].pop(opt))
+
+        # Default settings:
+        self.minimize_every_iter = options.get('minimize_every_iter', True)
+
+        # Algorithm limits
+        # Maximum number of iterations to perform.
+        self.maxiter = options.get('maxiter', None)
+        # Maximum number of function evaluations in the feasible domain
+        self.maxfev = options.get('maxfev', None)
+        # Maximum number of sampling evaluations (includes searching in
+        # infeasible points
+        self.maxev = options.get('maxev', None)
+        # Maximum processing runtime allowed
+        self.init = time.time()
+        self.maxtime = options.get('maxtime', None)
+        if 'f_min' in options:
+            # Specify the minimum objective function value, if it is known.
+            self.f_min_true = options['f_min']
+            self.f_tol = options.get('f_tol', 1e-4)
+        else:
+            self.f_min_true = None
+
+        self.minhgrd = options.get('minhgrd', None)
+
+        # Objective function knowledge
+        self.symmetry = options.get('symmetry', False)
+        if self.symmetry:
+            self.symmetry = [0, ]*len(self.bounds)
+        else:
+            self.symmetry = None
+        # Algorithm functionality
+        # Only evaluate a few of the best candidates
+        self.local_iter = options.get('local_iter', False)
+        self.infty_cons_sampl = options.get('infty_constraints', True)
+
+        # Feedback
+        self.disp = options.get('disp', False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self.HC.V._mapwrapper.__exit__(*args)
+
+    # Iteration properties
+    # Main construction loop:
+    def iterate_all(self):
+        """
+        Construct for `iters` iterations.
+
+        If uniform sampling is used, every iteration adds 'n' sampling points.
+
+        Iterations if a stopping criteria (e.g., sampling points or
+        processing time) has been met.
+
+        """
+        if self.disp:
+            logging.info('Splitting first generation')
+
+        while not self.stop_global:
+            if self.break_routine:
+                break
+            # Iterate complex, process minimisers
+            self.iterate()
+            self.stopping_criteria()
+
+        # Build minimiser pool
+        # Final iteration only needed if pools weren't minimised every
+        # iteration
+        if not self.minimize_every_iter:
+            if not self.break_routine:
+                self.find_minima()
+
+        self.res.nit = self.iters_done  # + 1
+        self.fn = self.HC.V.nfev
+
+    def find_minima(self):
+        """
+        Construct the minimizer pool, map the minimizers to local minima
+        and sort the results into a global return object.
+        """
+        if self.disp:
+            logging.info('Searching for minimizer pool...')
+
+        self.minimizers()
+
+        if len(self.X_min) != 0:
+            # Minimize the pool of minimizers with local minimization methods
+            # Note that if Options['local_iter'] is an `int` instead of default
+            # value False then only that number of candidates will be minimized
+            self.minimise_pool(self.local_iter)
+            # Sort results and build the global return object
+            self.sort_result()
+
+            # Lowest values used to report in case of failures
+            self.f_lowest = self.res.fun
+            self.x_lowest = self.res.x
+        else:
+            self.find_lowest_vertex()
+
+        if self.disp:
+            logging.info(f"Minimiser pool = SHGO.X_min = {self.X_min}")
+
+    def find_lowest_vertex(self):
+        # Find the lowest objective function value on one of
+        # the vertices of the simplicial complex
+        self.f_lowest = np.inf
+        for x in self.HC.V.cache:
+            if self.HC.V[x].f < self.f_lowest:
+                if self.disp:
+                    logging.info(f'self.HC.V[x].f = {self.HC.V[x].f}')
+                self.f_lowest = self.HC.V[x].f
+                self.x_lowest = self.HC.V[x].x_a
+        for lmc in self.LMC.cache:
+            if self.LMC[lmc].f_min < self.f_lowest:
+                self.f_lowest = self.LMC[lmc].f_min
+                self.x_lowest = self.LMC[lmc].x_l
+
+        if self.f_lowest == np.inf:  # no feasible point
+            self.f_lowest = None
+            self.x_lowest = None
+
+    # Stopping criteria functions:
+    def finite_iterations(self):
+        mi = min(x for x in [self.iters, self.maxiter] if x is not None)
+        if self.disp:
+            logging.info(f'Iterations done = {self.iters_done} / {mi}')
+        if self.iters is not None:
+            if self.iters_done >= (self.iters):
+                self.stop_global = True
+
+        if self.maxiter is not None:  # Stop for infeasible sampling
+            if self.iters_done >= (self.maxiter):
+                self.stop_global = True
+        return self.stop_global
+
+    def finite_fev(self):
+        # Finite function evals in the feasible domain
+        if self.disp:
+            logging.info(f'Function evaluations done = {self.fn} / {self.maxfev}')
+        if self.fn >= self.maxfev:
+            self.stop_global = True
+        return self.stop_global
+
+    def finite_ev(self):
+        # Finite evaluations including infeasible sampling points
+        if self.disp:
+            logging.info(f'Sampling evaluations done = {self.n_sampled} '
+                         f'/ {self.maxev}')
+        if self.n_sampled >= self.maxev:
+            self.stop_global = True
+
+    def finite_time(self):
+        if self.disp:
+            logging.info(f'Time elapsed = {time.time() - self.init} '
+                         f'/ {self.maxtime}')
+        if (time.time() - self.init) >= self.maxtime:
+            self.stop_global = True
+
+    def finite_precision(self):
+        """
+        Stop the algorithm if the final function value is known
+
+        Specify in options (with ``self.f_min_true = options['f_min']``)
+        and the tolerance with ``f_tol = options['f_tol']``
+        """
+        # If no minimizer has been found use the lowest sampling value
+        self.find_lowest_vertex()
+        if self.disp:
+            logging.info(f'Lowest function evaluation = {self.f_lowest}')
+            logging.info(f'Specified minimum = {self.f_min_true}')
+        # If no feasible point was return from test
+        if self.f_lowest is None:
+            return self.stop_global
+
+        # Function to stop algorithm at specified percentage error:
+        if self.f_min_true == 0.0:
+            if self.f_lowest <= self.f_tol:
+                self.stop_global = True
+        else:
+            pe = (self.f_lowest - self.f_min_true) / abs(self.f_min_true)
+            if self.f_lowest <= self.f_min_true:
+                self.stop_global = True
+                # 2if (pe - self.f_tol) <= abs(1.0 / abs(self.f_min_true)):
+                if abs(pe) >= 2 * self.f_tol:
+                    warnings.warn(
+                        f"A much lower value than expected f* = {self.f_min_true} "
+                        f"was found f_lowest = {self.f_lowest}",
+                        stacklevel=3
+                    )
+            if pe <= self.f_tol:
+                self.stop_global = True
+
+        return self.stop_global
+
+    def finite_homology_growth(self):
+        """
+        Stop the algorithm if homology group rank did not grow in iteration.
+        """
+        if self.LMC.size == 0:
+            return  # pass on no reason to stop yet.
+        self.hgrd = self.LMC.size - self.hgr
+
+        self.hgr = self.LMC.size
+        if self.hgrd <= self.minhgrd:
+            self.stop_global = True
+        if self.disp:
+            logging.info(f'Current homology growth = {self.hgrd} '
+                         f' (minimum growth = {self.minhgrd})')
+        return self.stop_global
+
+    def stopping_criteria(self):
+        """
+        Various stopping criteria ran every iteration
+
+        Returns
+        -------
+        stop : bool
+        """
+        if self.maxiter is not None:
+            self.finite_iterations()
+        if self.iters is not None:
+            self.finite_iterations()
+        if self.maxfev is not None:
+            self.finite_fev()
+        if self.maxev is not None:
+            self.finite_ev()
+        if self.maxtime is not None:
+            self.finite_time()
+        if self.f_min_true is not None:
+            self.finite_precision()
+        if self.minhgrd is not None:
+            self.finite_homology_growth()
+        return self.stop_global
+
+    def iterate(self):
+        self.iterate_complex()
+
+        # Build minimizer pool
+        if self.minimize_every_iter:
+            if not self.break_routine:
+                self.find_minima()  # Process minimizer pool
+
+        # Algorithm updates
+        self.iters_done += 1
+
+    def iterate_hypercube(self):
+        """
+        Iterate a subdivision of the complex
+
+        Note: called with ``self.iterate_complex()`` after class initiation
+        """
+        # Iterate the complex
+        if self.disp:
+            logging.info('Constructing and refining simplicial complex graph '
+                         'structure')
+        if self.n is None:
+            self.HC.refine_all()
+            self.n_sampled = self.HC.V.size()  # nevs counted
+        else:
+            self.HC.refine(self.n)
+            self.n_sampled += self.n
+
+        if self.disp:
+            logging.info('Triangulation completed, evaluating all constraints '
+                         'and objective function values.')
+
+        # Re-add minimisers to complex
+        if len(self.LMC.xl_maps) > 0:
+            for xl in self.LMC.cache:
+                v = self.HC.V[xl]
+                v_near = v.star()
+                for v in v.nn:
+                    v_near = v_near.union(v.nn)
+                # Reconnect vertices to complex
+                # if self.HC.connect_vertex_non_symm(tuple(self.LMC[xl].x_l),
+                #                                   near=v_near):
+                #    continue
+                # else:
+                    # If failure to find in v_near, then search all vertices
+                    # (very expensive operation:
+                #    self.HC.connect_vertex_non_symm(tuple(self.LMC[xl].x_l)
+                #                                    )
+
+        # Evaluate all constraints and functions
+        self.HC.V.process_pools()
+        if self.disp:
+            logging.info('Evaluations completed.')
+
+        # feasible sampling points counted by the triangulation.py routines
+        self.fn = self.HC.V.nfev
+        return
+
+    def iterate_delaunay(self):
+        """
+        Build a complex of Delaunay triangulated points
+
+        Note: called with ``self.iterate_complex()`` after class initiation
+        """
+        self.nc += self.n
+        self.sampled_surface(infty_cons_sampl=self.infty_cons_sampl)
+
+        # Add sampled points to a triangulation, construct self.Tri
+        if self.disp:
+            logging.info(f'self.n = {self.n}')
+            logging.info(f'self.nc = {self.nc}')
+            logging.info('Constructing and refining simplicial complex graph '
+                         'structure from sampling points.')
+
+        if self.dim < 2:
+            self.Ind_sorted = np.argsort(self.C, axis=0)
+            self.Ind_sorted = self.Ind_sorted.flatten()
+            tris = []
+            for ind, ind_s in enumerate(self.Ind_sorted):
+                if ind > 0:
+                    tris.append(self.Ind_sorted[ind - 1:ind + 1])
+
+            tris = np.array(tris)
+            # Store 1D triangulation:
+            self.Tri = namedtuple('Tri', ['points', 'simplices'])(self.C, tris)
+            self.points = {}
+        else:
+            if self.C.shape[0] > self.dim + 1:  # Ensure a simplex can be built
+                self.delaunay_triangulation(n_prc=self.n_prc)
+            self.n_prc = self.C.shape[0]
+
+        if self.disp:
+            logging.info('Triangulation completed, evaluating all '
+                         'constraints and objective function values.')
+
+        if hasattr(self, 'Tri'):
+            self.HC.vf_to_vv(self.Tri.points, self.Tri.simplices)
+
+        # Process all pools
+        # Evaluate all constraints and functions
+        if self.disp:
+            logging.info('Triangulation completed, evaluating all constraints '
+                         'and objective function values.')
+
+        # Evaluate all constraints and functions
+        self.HC.V.process_pools()
+        if self.disp:
+            logging.info('Evaluations completed.')
+
+        # feasible sampling points counted by the triangulation.py routines
+        self.fn = self.HC.V.nfev
+        self.n_sampled = self.nc  # nevs counted in triangulation
+        return
+
+    # Hypercube minimizers
+    def minimizers(self):
+        """
+        Returns the indexes of all minimizers
+        """
+        self.minimizer_pool = []
+        # Note: Can implement parallelization here
+        for x in self.HC.V.cache:
+            in_LMC = False
+            if len(self.LMC.xl_maps) > 0:
+                for xlmi in self.LMC.xl_maps:
+                    if np.all(np.array(x) == np.array(xlmi)):
+                        in_LMC = True
+            if in_LMC:
+                continue
+
+            if self.HC.V[x].minimiser():
+                if self.disp:
+                    logging.info('=' * 60)
+                    logging.info(f'v.x = {self.HC.V[x].x_a} is minimizer')
+                    logging.info(f'v.f = {self.HC.V[x].f} is minimizer')
+                    logging.info('=' * 30)
+
+                if self.HC.V[x] not in self.minimizer_pool:
+                    self.minimizer_pool.append(self.HC.V[x])
+
+                if self.disp:
+                    logging.info('Neighbors:')
+                    logging.info('=' * 30)
+                    for vn in self.HC.V[x].nn:
+                        logging.info(f'x = {vn.x} || f = {vn.f}')
+
+                    logging.info('=' * 60)
+        self.minimizer_pool_F = []
+        self.X_min = []
+        # normalized tuple in the Vertex cache
+        self.X_min_cache = {}  # Cache used in hypercube sampling
+
+        for v in self.minimizer_pool:
+            self.X_min.append(v.x_a)
+            self.minimizer_pool_F.append(v.f)
+            self.X_min_cache[tuple(v.x_a)] = v.x
+
+        self.minimizer_pool_F = np.array(self.minimizer_pool_F)
+        self.X_min = np.array(self.X_min)
+
+        # TODO: Only do this if global mode
+        self.sort_min_pool()
+
+        return self.X_min
+
+    # Local minimisation
+    # Minimiser pool processing
+    def minimise_pool(self, force_iter=False):
+        """
+        This processing method can optionally minimise only the best candidate
+        solutions in the minimiser pool
+
+        Parameters
+        ----------
+        force_iter : int
+                     Number of starting minimizers to process (can be specified
+                     globally or locally)
+
+        """
+        # Find first local minimum
+        # NOTE: Since we always minimize this value regardless it is a waste to
+        # build the topograph first before minimizing
+        lres_f_min = self.minimize(self.X_min[0], ind=self.minimizer_pool[0])
+
+        # Trim minimized point from current minimizer set
+        self.trim_min_pool(0)
+
+        while not self.stop_l_iter:
+            # Global stopping criteria:
+            self.stopping_criteria()
+
+            # Note first iteration is outside loop:
+            if force_iter:
+                force_iter -= 1
+                if force_iter == 0:
+                    self.stop_l_iter = True
+                    break
+
+            if np.shape(self.X_min)[0] == 0:
+                self.stop_l_iter = True
+                break
+
+            # Construct topograph from current minimizer set
+            # (NOTE: This is a very small topograph using only the minizer pool
+            #        , it might be worth using some graph theory tools instead.
+            self.g_topograph(lres_f_min.x, self.X_min)
+
+            # Find local minimum at the miniser with the greatest Euclidean
+            # distance from the current solution
+            ind_xmin_l = self.Z[:, -1]
+            lres_f_min = self.minimize(self.Ss[-1, :], self.minimizer_pool[-1])
+
+            # Trim minimised point from current minimizer set
+            self.trim_min_pool(ind_xmin_l)
+
+        # Reset controls
+        self.stop_l_iter = False
+        return
+
+    def sort_min_pool(self):
+        # Sort to find minimum func value in min_pool
+        self.ind_f_min = np.argsort(self.minimizer_pool_F)
+        self.minimizer_pool = np.array(self.minimizer_pool)[self.ind_f_min]
+        self.minimizer_pool_F = np.array(self.minimizer_pool_F)[
+            self.ind_f_min]
+        return
+
+    def trim_min_pool(self, trim_ind):
+        self.X_min = np.delete(self.X_min, trim_ind, axis=0)
+        self.minimizer_pool_F = np.delete(self.minimizer_pool_F, trim_ind)
+        self.minimizer_pool = np.delete(self.minimizer_pool, trim_ind)
+        return
+
+    def g_topograph(self, x_min, X_min):
+        """
+        Returns the topographical vector stemming from the specified value
+        ``x_min`` for the current feasible set ``X_min`` with True boolean
+        values indicating positive entries and False values indicating
+        negative entries.
+
+        """
+        x_min = np.array([x_min])
+        self.Y = spatial.distance.cdist(x_min, X_min, 'euclidean')
+        # Find sorted indexes of spatial distances:
+        self.Z = np.argsort(self.Y, axis=-1)
+
+        self.Ss = X_min[self.Z][0]
+        self.minimizer_pool = self.minimizer_pool[self.Z]
+        self.minimizer_pool = self.minimizer_pool[0]
+        return self.Ss
+
+    # Local bound functions
+    def construct_lcb_simplicial(self, v_min):
+        """
+        Construct locally (approximately) convex bounds
+
+        Parameters
+        ----------
+        v_min : Vertex object
+                The minimizer vertex
+
+        Returns
+        -------
+        cbounds : list of lists
+            List of size dimension with length-2 list of bounds for each
+            dimension.
+
+        """
+        cbounds = [[x_b_i[0], x_b_i[1]] for x_b_i in self.bounds]
+        # Loop over all bounds
+        for vn in v_min.nn:
+            for i, x_i in enumerate(vn.x_a):
+                # Lower bound
+                if (x_i < v_min.x_a[i]) and (x_i > cbounds[i][0]):
+                    cbounds[i][0] = x_i
+
+                # Upper bound
+                if (x_i > v_min.x_a[i]) and (x_i < cbounds[i][1]):
+                    cbounds[i][1] = x_i
+
+        if self.disp:
+            logging.info(f'cbounds found for v_min.x_a = {v_min.x_a}')
+            logging.info(f'cbounds = {cbounds}')
+
+        return cbounds
+
+    def construct_lcb_delaunay(self, v_min, ind=None):
+        """
+        Construct locally (approximately) convex bounds
+
+        Parameters
+        ----------
+        v_min : Vertex object
+                The minimizer vertex
+
+        Returns
+        -------
+        cbounds : list of lists
+            List of size dimension with length-2 list of bounds for each
+            dimension.
+        """
+        cbounds = [[x_b_i[0], x_b_i[1]] for x_b_i in self.bounds]
+
+        return cbounds
+
+    # Minimize a starting point locally
+    def minimize(self, x_min, ind=None):
+        """
+        This function is used to calculate the local minima using the specified
+        sampling point as a starting value.
+
+        Parameters
+        ----------
+        x_min : vector of floats
+            Current starting point to minimize.
+
+        Returns
+        -------
+        lres : OptimizeResult
+            The local optimization result represented as a `OptimizeResult`
+            object.
+        """
+        # Use minima maps if vertex was already run
+        if self.disp:
+            logging.info(f'Vertex minimiser maps = {self.LMC.v_maps}')
+
+        if self.LMC[x_min].lres is not None:
+            logging.info(f'Found self.LMC[x_min].lres = '
+                         f'{self.LMC[x_min].lres}')
+            return self.LMC[x_min].lres
+
+        if self.callback is not None:
+            logging.info(f'Callback for minimizer starting at {x_min}:')
+
+        if self.disp:
+            logging.info(f'Starting minimization at {x_min}...')
+
+        if self.sampling_method == 'simplicial':
+            x_min_t = tuple(x_min)
+            # Find the normalized tuple in the Vertex cache:
+            x_min_t_norm = self.X_min_cache[tuple(x_min_t)]
+            x_min_t_norm = tuple(x_min_t_norm)
+            g_bounds = self.construct_lcb_simplicial(self.HC.V[x_min_t_norm])
+            if 'bounds' in self.min_solver_args:
+                self.minimizer_kwargs['bounds'] = g_bounds
+                logging.info(self.minimizer_kwargs['bounds'])
+
+        else:
+            g_bounds = self.construct_lcb_delaunay(x_min, ind=ind)
+            if 'bounds' in self.min_solver_args:
+                self.minimizer_kwargs['bounds'] = g_bounds
+                logging.info(self.minimizer_kwargs['bounds'])
+
+        if self.disp and 'bounds' in self.minimizer_kwargs:
+            logging.info('bounds in kwarg:')
+            logging.info(self.minimizer_kwargs['bounds'])
+
+        # Local minimization using scipy.optimize.minimize:
+        lres = minimize(self.func, x_min, **self.minimizer_kwargs)
+
+        if self.disp:
+            logging.info(f'lres = {lres}')
+
+        # Local function evals for all minimizers
+        self.res.nlfev += lres.nfev
+        if 'njev' in lres:
+            self.res.nljev += lres.njev
+        if 'nhev' in lres:
+            self.res.nlhev += lres.nhev
+
+        try:  # Needed because of the brain dead 1x1 NumPy arrays
+            lres.fun = lres.fun[0]
+        except (IndexError, TypeError):
+            lres.fun
+
+        # Append minima maps
+        self.LMC[x_min]
+        self.LMC.add_res(x_min, lres, bounds=g_bounds)
+
+        return lres
+
+    # Post local minimization processing
+    def sort_result(self):
+        """
+        Sort results and build the global return object
+        """
+        # Sort results in local minima cache
+        results = self.LMC.sort_cache_result()
+        self.res.xl = results['xl']
+        self.res.funl = results['funl']
+        self.res.x = results['x']
+        self.res.fun = results['fun']
+
+        # Add local func evals to sampling func evals
+        # Count the number of feasible vertices and add to local func evals:
+        self.res.nfev = self.fn + self.res.nlfev
+        return self.res
+
+    # Algorithm controls
+    def fail_routine(self, mes=("Failed to converge")):
+        self.break_routine = True
+        self.res.success = False
+        self.X_min = [None]
+        self.res.message = mes
+
+    def sampled_surface(self, infty_cons_sampl=False):
+        """
+        Sample the function surface.
+
+        There are 2 modes, if ``infty_cons_sampl`` is True then the sampled
+        points that are generated outside the feasible domain will be
+        assigned an ``inf`` value in accordance with SHGO rules.
+        This guarantees convergence and usually requires less objective
+        function evaluations at the computational costs of more Delaunay
+        triangulation points.
+
+        If ``infty_cons_sampl`` is False, then the infeasible points are
+        discarded and only a subspace of the sampled points are used. This
+        comes at the cost of the loss of guaranteed convergence and usually
+        requires more objective function evaluations.
+        """
+        # Generate sampling points
+        if self.disp:
+            logging.info('Generating sampling points')
+        self.sampling(self.nc, self.dim)
+        if len(self.LMC.xl_maps) > 0:
+            self.C = np.vstack((self.C, np.array(self.LMC.xl_maps)))
+        if not infty_cons_sampl:
+            # Find subspace of feasible points
+            if self.g_cons is not None:
+                self.sampling_subspace()
+
+        # Sort remaining samples
+        self.sorted_samples()
+
+        # Find objective function references
+        self.n_sampled = self.nc
+
+    def sampling_custom(self, n, dim):
+        """
+        Generates uniform sampling points in a hypercube and scales the points
+        to the bound limits.
+        """
+        # Generate sampling points.
+        # Generate uniform sample points in [0, 1]^m \subset R^m
+        self.C = self.sampling_function(n, dim)
+        # Distribute over bounds
+        for i in range(len(self.bounds)):
+            self.C[:, i] = (self.C[:, i] *
+                            (self.bounds[i][1] - self.bounds[i][0])
+                            + self.bounds[i][0])
+        return self.C
+
+    def sampling_subspace(self):
+        """Find subspace of feasible points from g_func definition"""
+        # Subspace of feasible points.
+        for ind, g in enumerate(self.g_cons):
+            # C.shape = (Z, dim) where Z is the number of sampling points to
+            # evaluate and dim is the dimensionality of the problem.
+            # the constraint function may not be vectorised so have to step
+            # through each sampling point sequentially.
+            feasible = np.array(
+                [np.all(g(x_C, *self.g_args[ind]) >= 0.0) for x_C in self.C],
+                dtype=bool
+            )
+            self.C = self.C[feasible]
+
+            if self.C.size == 0:
+                self.res.message = ('No sampling point found within the '
+                                    + 'feasible set. Increasing sampling '
+                                    + 'size.')
+                # sampling correctly for both 1-D and >1-D cases
+                if self.disp:
+                    logging.info(self.res.message)
+
+    def sorted_samples(self):  # Validated
+        """Find indexes of the sorted sampling points"""
+        self.Ind_sorted = np.argsort(self.C, axis=0)
+        self.Xs = self.C[self.Ind_sorted]
+        return self.Ind_sorted, self.Xs
+
+    def delaunay_triangulation(self, n_prc=0):
+        if hasattr(self, 'Tri') and self.qhull_incremental:
+            # TODO: Uncertain if n_prc needs to add len(self.LMC.xl_maps)
+            # in self.sampled_surface
+            self.Tri.add_points(self.C[n_prc:, :])
+        else:
+            try:
+                self.Tri = spatial.Delaunay(self.C,
+                                            incremental=self.qhull_incremental,
+                                            )
+            except spatial.QhullError:
+                if str(sys.exc_info()[1])[:6] == 'QH6239':
+                    logging.warning('QH6239 Qhull precision error detected, '
+                                    'this usually occurs when no bounds are '
+                                    'specified, Qhull can only run with '
+                                    'handling cocircular/cospherical points'
+                                    ' and in this case incremental mode is '
+                                    'switched off. The performance of shgo '
+                                    'will be reduced in this mode.')
+                    self.qhull_incremental = False
+                    self.Tri = spatial.Delaunay(self.C,
+                                                incremental=
+                                                self.qhull_incremental)
+                else:
+                    raise
+
+        return self.Tri
+
+
+class LMap:
+    def __init__(self, v):
+        self.v = v
+        self.x_l = None
+        self.lres = None
+        self.f_min = None
+        self.lbounds = []
+
+
+class LMapCache:
+    def __init__(self):
+        self.cache = {}
+
+        # Lists for search queries
+        self.v_maps = []
+        self.xl_maps = []
+        self.xl_maps_set = set()
+        self.f_maps = []
+        self.lbound_maps = []
+        self.size = 0
+
+    def __getitem__(self, v):
+        try:
+            v = np.ndarray.tolist(v)
+        except TypeError:
+            pass
+        v = tuple(v)
+        try:
+            return self.cache[v]
+        except KeyError:
+            xval = LMap(v)
+            self.cache[v] = xval
+
+            return self.cache[v]
+
+    def add_res(self, v, lres, bounds=None):
+        v = np.ndarray.tolist(v)
+        v = tuple(v)
+        self.cache[v].x_l = lres.x
+        self.cache[v].lres = lres
+        self.cache[v].f_min = lres.fun
+        self.cache[v].lbounds = bounds
+
+        # Update cache size
+        self.size += 1
+
+        # Cache lists for search queries
+        self.v_maps.append(v)
+        self.xl_maps.append(lres.x)
+        self.xl_maps_set.add(tuple(lres.x))
+        self.f_maps.append(lres.fun)
+        self.lbound_maps.append(bounds)
+
+    def sort_cache_result(self):
+        """
+        Sort results and build the global return object
+        """
+        results = {}
+        # Sort results and save
+        self.xl_maps = np.array(self.xl_maps)
+        self.f_maps = np.array(self.f_maps)
+
+        # Sorted indexes in Func_min
+        ind_sorted = np.argsort(self.f_maps)
+
+        # Save ordered list of minima
+        results['xl'] = self.xl_maps[ind_sorted]  # Ordered x vals
+        self.f_maps = np.array(self.f_maps)
+        results['funl'] = self.f_maps[ind_sorted]
+        results['funl'] = results['funl'].T
+
+        # Find global of all minimizers
+        results['x'] = self.xl_maps[ind_sorted[0]]  # Save global minima
+        results['fun'] = self.f_maps[ind_sorted[0]]  # Save global fun value
+
+        self.xl_maps = np.ndarray.tolist(self.xl_maps)
+        self.f_maps = np.ndarray.tolist(self.f_maps)
+        return results
+
+
+
+
+
+"""Base classes for low memory simplicial complex structures."""
+import copy
+import logging
+import itertools
+import decimal
+from functools import cache
+
+import numpy as np
+
+from ._vertex import (VertexCacheField, VertexCacheIndex)
+
+
+class Complex:
+    """
+    Base class for a simplicial complex described as a cache of vertices
+    together with their connections.
+
+    Important methods:
+        Domain triangulation:
+                Complex.triangulate, Complex.split_generation
+        Triangulating arbitrary points (must be traingulable,
+            may exist outside domain):
+                Complex.triangulate(sample_set)
+        Converting another simplicial complex structure data type to the
+            structure used in Complex (ex. OBJ wavefront)
+                Complex.convert(datatype, data)
+
+    Important objects:
+        HC.V: The cache of vertices and their connection
+        HC.H: Storage structure of all vertex groups
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimensionality of the complex R^dim
+    domain : list of tuples, optional
+        The bounds [x_l, x_u]^dim of the hyperrectangle space
+        ex. The default domain is the hyperrectangle [0, 1]^dim
+        Note: The domain must be convex, non-convex spaces can be cut
+              away from this domain using the non-linear
+              g_cons functions to define any arbitrary domain
+              (these domains may also be disconnected from each other)
+    sfield :
+        A scalar function defined in the associated domain f: R^dim --> R
+    sfield_args : tuple
+        Additional arguments to be passed to `sfield`
+    vfield :
+        A scalar function defined in the associated domain
+                       f: R^dim --> R^m
+                   (for example a gradient function of the scalar field)
+    vfield_args : tuple
+        Additional arguments to be passed to vfield
+    symmetry : None or list
+            Specify if the objective function contains symmetric variables.
+            The search space (and therefore performance) is decreased by up to
+            O(n!) times in the fully symmetric case.
+
+            E.g.  f(x) = (x_1 + x_2 + x_3) + (x_4)**2 + (x_5)**2 + (x_6)**2
+
+            In this equation x_2 and x_3 are symmetric to x_1, while x_5 and
+             x_6 are symmetric to x_4, this can be specified to the solver as:
+
+            symmetry = [0,  # Variable 1
+                        0,  # symmetric to variable 1
+                        0,  # symmetric to variable 1
+                        3,  # Variable 4
+                        3,  # symmetric to variable 4
+                        3,  # symmetric to variable 4
+                        ]
+
+    constraints : dict or sequence of dict, optional
+        Constraints definition.
+        Function(s) ``R**n`` in the form::
+
+            g(x) <= 0 applied as g : R^n -> R^m
+            h(x) == 0 applied as h : R^n -> R^p
+
+        Each constraint is defined in a dictionary with fields:
+
+            type : str
+                Constraint type: 'eq' for equality, 'ineq' for inequality.
+            fun : callable
+                The function defining the constraint.
+            jac : callable, optional
+                The Jacobian of `fun` (only for SLSQP).
+            args : sequence, optional
+                Extra arguments to be passed to the function and Jacobian.
+
+        Equality constraint means that the constraint function result is to
+        be zero whereas inequality means that it is to be
+        non-negative.constraints : dict or sequence of dict, optional
+        Constraints definition.
+        Function(s) ``R**n`` in the form::
+
+            g(x) <= 0 applied as g : R^n -> R^m
+            h(x) == 0 applied as h : R^n -> R^p
+
+        Each constraint is defined in a dictionary with fields:
+
+            type : str
+                Constraint type: 'eq' for equality, 'ineq' for inequality.
+            fun : callable
+                The function defining the constraint.
+            jac : callable, optional
+                The Jacobian of `fun` (unused).
+            args : sequence, optional
+                Extra arguments to be passed to the function and Jacobian.
+
+        Equality constraint means that the constraint function result is to
+        be zero whereas inequality means that it is to be non-negative.
+
+    workers : int  optional
+        Uses `multiprocessing.Pool <multiprocessing>`) to compute the field
+         functions in parallel.
+    """
+    def __init__(self, dim, domain=None, sfield=None, sfield_args=(),
+                 symmetry=None, constraints=None, workers=1):
+        self.dim = dim
+
+        # Domains
+        self.domain = domain
+        if domain is None:
+            self.bounds = [(0.0, 1.0), ] * dim
+        else:
+            self.bounds = domain
+        self.symmetry = symmetry
+        #      here in init to avoid if checks
+
+        # Field functions
+        self.sfield = sfield
+        self.sfield_args = sfield_args
+
+        # Process constraints
+        # Constraints
+        # Process constraint dict sequence:
+        if constraints is not None:
+            self.min_cons = constraints
+            self.g_cons = []
+            self.g_args = []
+            if not isinstance(constraints, tuple | list):
+                constraints = (constraints,)
+
+            for cons in constraints:
+                if cons['type'] in ('ineq'):
+                    self.g_cons.append(cons['fun'])
+                    try:
+                        self.g_args.append(cons['args'])
+                    except KeyError:
+                        self.g_args.append(())
+            self.g_cons = tuple(self.g_cons)
+            self.g_args = tuple(self.g_args)
+        else:
+            self.g_cons = None
+            self.g_args = None
+
+        # Homology properties
+        self.gen = 0
+        self.perm_cycle = 0
+
+        # Every cell is stored in a list of its generation,
+        # ex. the initial cell is stored in self.H[0]
+        # 1st get new cells are stored in self.H[1] etc.
+        # When a cell is sub-generated it is removed from this list
+
+        self.H = []  # Storage structure of vertex groups
+
+        # Cache of all vertices
+        if (sfield is not None) or (self.g_cons is not None):
+            # Initiate a vertex cache and an associated field cache, note that
+            # the field case is always initiated inside the vertex cache if an
+            # associated field scalar field is defined:
+            if sfield is not None:
+                self.V = VertexCacheField(field=sfield, field_args=sfield_args,
+                                          g_cons=self.g_cons,
+                                          g_cons_args=self.g_args,
+                                          workers=workers)
+            elif self.g_cons is not None:
+                self.V = VertexCacheField(field=sfield, field_args=sfield_args,
+                                          g_cons=self.g_cons,
+                                          g_cons_args=self.g_args,
+                                          workers=workers)
+        else:
+            self.V = VertexCacheIndex()
+
+        self.V_non_symm = []  # List of non-symmetric vertices
+        self.split_edge = cache(self._split_edge)
+
+    def __call__(self):
+        return self.H
+
+    # %% Triangulation methods
+    def cyclic_product(self, bounds, origin, supremum, centroid=True):
+        """Generate initial triangulation using cyclic product"""
+        # Define current hyperrectangle
+        vot = tuple(origin)
+        vut = tuple(supremum)  # Hyperrectangle supremum
+        self.V[vot]
+        vo = self.V[vot]
+        yield vo.x
+        self.V[vut].connect(self.V[vot])
+        yield vut
+        # Cyclic group approach with second x_l --- x_u operation.
+
+        # These containers store the "lower" and "upper" vertices
+        # corresponding to the origin or supremum of every C2 group.
+        # It has the structure of `dim` times embedded lists each containing
+        # these vertices as the entire complex grows. Bounds[0] has to be done
+        # outside the loops before we have symmetric containers.
+        # NOTE: This means that bounds[0][1] must always exist
+        C0x = [[self.V[vot]]]
+        a_vo = copy.copy(list(origin))
+        a_vo[0] = vut[0]  # Update aN Origin
+        a_vo = self.V[tuple(a_vo)]
+        # self.V[vot].connect(self.V[tuple(a_vo)])
+        self.V[vot].connect(a_vo)
+        yield a_vo.x
+        C1x = [[a_vo]]
+        # C1x = [[self.V[tuple(a_vo)]]]
+        ab_C = []  # Container for a + b operations
+
+        # Loop over remaining bounds
+        for i, x in enumerate(bounds[1:]):
+            # Update lower and upper containers
+            C0x.append([])
+            C1x.append([])
+            # try to access a second bound (if not, C1 is symmetric)
+            try:
+                # Early try so that we don't have to copy the cache before
+                # moving on to next C1/C2: Try to add the operation of a new
+                # C2 product by accessing the upper bound
+                x[1]
+                # Copy lists for iteration
+                cC0x = [x[:] for x in C0x[:i + 1]]
+                cC1x = [x[:] for x in C1x[:i + 1]]
+                for j, (VL, VU) in enumerate(zip(cC0x, cC1x)):
+                    for k, (vl, vu) in enumerate(zip(VL, VU)):
+                        # Build aN vertices for each lower-upper pair in N:
+                        a_vl = list(vl.x)
+                        a_vu = list(vu.x)
+                        a_vl[i + 1] = vut[i + 1]
+                        a_vu[i + 1] = vut[i + 1]
+                        a_vl = self.V[tuple(a_vl)]
+
+                        # Connect vertices in N to corresponding vertices
+                        # in aN:
+                        vl.connect(a_vl)
+
+                        yield a_vl.x
+
+                        a_vu = self.V[tuple(a_vu)]
+                        # Connect vertices in N to corresponding vertices
+                        # in aN:
+                        vu.connect(a_vu)
+
+                        # Connect new vertex pair in aN:
+                        a_vl.connect(a_vu)
+
+                        # Connect lower pair to upper (triangulation
+                        # operation of a + b (two arbitrary operations):
+                        vl.connect(a_vu)
+                        ab_C.append((vl, a_vu))
+
+                        # Update the containers
+                        C0x[i + 1].append(vl)
+                        C0x[i + 1].append(vu)
+                        C1x[i + 1].append(a_vl)
+                        C1x[i + 1].append(a_vu)
+
+                        # Update old containers
+                        C0x[j].append(a_vl)
+                        C1x[j].append(a_vu)
+
+                        # Yield new points
+                        yield a_vu.x
+
+                # Try to connect aN lower source of previous a + b
+                # operation with a aN vertex
+                ab_Cc = copy.copy(ab_C)
+
+                for vp in ab_Cc:
+                    b_v = list(vp[0].x)
+                    ab_v = list(vp[1].x)
+                    b_v[i + 1] = vut[i + 1]
+                    ab_v[i + 1] = vut[i + 1]
+                    b_v = self.V[tuple(b_v)]  # b + vl
+                    ab_v = self.V[tuple(ab_v)]  # b + a_vl
+                    # Note o---o is already connected
+                    vp[0].connect(ab_v)  # o-s
+                    b_v.connect(ab_v)  # s-s
+
+                    # Add new list of cross pairs
+                    ab_C.append((vp[0], ab_v))
+                    ab_C.append((b_v, ab_v))
+
+            except IndexError:
+                cC0x = C0x[i]
+                cC1x = C1x[i]
+                VL, VU = cC0x, cC1x
+                for k, (vl, vu) in enumerate(zip(VL, VU)):
+                    # Build aN vertices for each lower-upper pair in N:
+                    a_vu = list(vu.x)
+                    a_vu[i + 1] = vut[i + 1]
+                    # Connect vertices in N to corresponding vertices
+                    # in aN:
+                    a_vu = self.V[tuple(a_vu)]
+                    # Connect vertices in N to corresponding vertices
+                    # in aN:
+                    vu.connect(a_vu)
+                    # Connect new vertex pair in aN:
+                    # a_vl.connect(a_vu)
+                    # Connect lower pair to upper (triangulation
+                    # operation of a + b (two arbitrary operations):
+                    vl.connect(a_vu)
+                    ab_C.append((vl, a_vu))
+                    C0x[i + 1].append(vu)
+                    C1x[i + 1].append(a_vu)
+                    # Yield new points
+                    a_vu.connect(self.V[vut])
+                    yield a_vu.x
+                    ab_Cc = copy.copy(ab_C)
+                    for vp in ab_Cc:
+                        if vp[1].x[i] == vut[i]:
+                            ab_v = list(vp[1].x)
+                            ab_v[i + 1] = vut[i + 1]
+                            ab_v = self.V[tuple(ab_v)]  # b + a_vl
+                            # Note o---o is already connected
+                            vp[0].connect(ab_v)  # o-s
+
+                            # Add new list of cross pairs
+                            ab_C.append((vp[0], ab_v))
+
+        # Clean class trash
+        try:
+            del C0x
+            del cC0x
+            del C1x
+            del cC1x
+            del ab_C
+            del ab_Cc
+        except UnboundLocalError:
+            pass
+
+        # Extra yield to ensure that the triangulation is completed
+        if centroid:
+            vo = self.V[vot]
+            vs = self.V[vut]
+            # Disconnect the origin and supremum
+            vo.disconnect(vs)
+            # Build centroid
+            vc = self.split_edge(vot, vut)
+            for v in vo.nn:
+                v.connect(vc)
+            yield vc.x
+            return vc.x
+        else:
+            yield vut
+            return vut
+
+    def triangulate(self, n=None, symmetry=None, centroid=True,
+                    printout=False):
+        """
+        Triangulate the initial domain, if n is not None then a limited number
+        of points will be generated
+
+        Parameters
+        ----------
+        n : int, Number of points to be sampled.
+        symmetry :
+
+            Ex. Dictionary/hashtable
+            f(x) = (x_1 + x_2 + x_3) + (x_4)**2 + (x_5)**2 + (x_6)**2
+
+            symmetry = symmetry[0]: 0,  # Variable 1
+                       symmetry[1]: 0,  # symmetric to variable 1
+                       symmetry[2]: 0,  # symmetric to variable 1
+                       symmetry[3]: 3,  # Variable 4
+                       symmetry[4]: 3,  # symmetric to variable 4
+                       symmetry[5]: 3,  # symmetric to variable 4
+                        }
+        centroid : bool, if True add a central point to the hypercube
+        printout : bool, if True print out results
+
+        NOTES:
+        ------
+        Rather than using the combinatorial algorithm to connect vertices we
+        make the following observation:
+
+        The bound pairs are similar a C2 cyclic group and the structure is
+        formed using the cartesian product:
+
+        H = C2 x C2 x C2 ... x C2 (dim times)
+
+        So construct any normal subgroup N and consider H/N first, we connect
+        all vertices within N (ex. N is C2 (the first dimension), then we move
+        to a left coset aN (an operation moving around the defined H/N group by
+        for example moving from the lower bound in C2 (dimension 2) to the
+        higher bound in C2. During this operation connection all the vertices.
+        Now repeat the N connections. Note that these elements can be connected
+        in parallel.
+        """
+        # Inherit class arguments
+        if symmetry is None:
+            symmetry = self.symmetry
+        # Build origin and supremum vectors
+        origin = [i[0] for i in self.bounds]
+        self.origin = origin
+        supremum = [i[1] for i in self.bounds]
+
+        self.supremum = supremum
+
+        if symmetry is None:
+            cbounds = self.bounds
+        else:
+            cbounds = copy.copy(self.bounds)
+            for i, j in enumerate(symmetry):
+                if i is not j:
+                    # pop second entry on second symmetry vars
+                    cbounds[i] = [self.bounds[symmetry[i]][0]]
+                    # Sole (first) entry is the sup value and there is no
+                    # origin:
+                    cbounds[i] = [self.bounds[symmetry[i]][1]]
+                    if (self.bounds[symmetry[i]] is not
+                            self.bounds[symmetry[j]]):
+                        logging.warning(f"Variable {i} was specified as "
+                                        f"symmetric to variable {j}, however"
+                                        f", the bounds {i} ="
+                                        f" {self.bounds[symmetry[i]]} and {j}"
+                                        f" ="
+                                        f" {self.bounds[symmetry[j]]} do not "
+                                        f"match, the mismatch was ignored in "
+                                        f"the initial triangulation.")
+                        cbounds[i] = self.bounds[symmetry[j]]
+
+        if n is None:
+            # Build generator
+            self.cp = self.cyclic_product(cbounds, origin, supremum, centroid)
+            for i in self.cp:
+                i
+
+            try:
+                self.triangulated_vectors.append((tuple(self.origin),
+                                                  tuple(self.supremum)))
+            except (AttributeError, KeyError):
+                self.triangulated_vectors = [(tuple(self.origin),
+                                              tuple(self.supremum))]
+
+        else:
+            # Check if generator already exists
+            try:
+                self.cp
+            except (AttributeError, KeyError):
+                self.cp = self.cyclic_product(cbounds, origin, supremum,
+                                              centroid)
+
+            try:
+                while len(self.V.cache) < n:
+                    next(self.cp)
+            except StopIteration:
+                try:
+                    self.triangulated_vectors.append((tuple(self.origin),
+                                                      tuple(self.supremum)))
+                except (AttributeError, KeyError):
+                    self.triangulated_vectors = [(tuple(self.origin),
+                                                  tuple(self.supremum))]
+
+        if printout:
+            # for v in self.C0():
+            #   v.print_out()
+            for v in self.V.cache:
+                self.V[v].print_out()
+
+        return
+
+    def refine(self, n=1):
+        if n is None:
+            try:
+                self.triangulated_vectors
+                self.refine_all()
+                return
+            except AttributeError as ae:
+                if str(ae) == "'Complex' object has no attribute " \
+                              "'triangulated_vectors'":
+                    self.triangulate(symmetry=self.symmetry)
+                    return
+                else:
+                    raise
+
+        nt = len(self.V.cache) + n  # Target number of total vertices
+        # In the outer while loop we iterate until we have added an extra `n`
+        # vertices to the complex:
+        while len(self.V.cache) < nt:  # while loop 1
+            try:  # try 1
+                # Try to access triangulated_vectors, this should only be
+                # defined if an initial triangulation has already been
+                # performed:
+                self.triangulated_vectors
+                # Try a usual iteration of the current generator, if it
+                # does not exist or is exhausted then produce a new generator
+                try:  # try 2
+                    next(self.rls)
+                except (AttributeError, StopIteration, KeyError):
+                    vp = self.triangulated_vectors[0]
+                    self.rls = self.refine_local_space(*vp, bounds=self.bounds)
+                    next(self.rls)
+
+            except (AttributeError, KeyError):
+                # If an initial triangulation has not been completed, then
+                # we start/continue the initial triangulation targeting `nt`
+                # vertices, if nt is greater than the initial number of
+                # vertices then the `refine` routine will move back to try 1.
+                self.triangulate(nt, self.symmetry)
+        return
+
+    def refine_all(self, centroids=True):
+        """Refine the entire domain of the current complex."""
+        try:
+            self.triangulated_vectors
+            tvs = copy.copy(self.triangulated_vectors)
+            for i, vp in enumerate(tvs):
+                self.rls = self.refine_local_space(*vp, bounds=self.bounds)
+                for i in self.rls:
+                    i
+        except AttributeError as ae:
+            if str(ae) == "'Complex' object has no attribute " \
+                          "'triangulated_vectors'":
+                self.triangulate(symmetry=self.symmetry, centroid=centroids)
+            else:
+                raise
+
+        # This adds a centroid to every new sub-domain generated and defined
+        # by self.triangulated_vectors, in addition the vertices ! to complete
+        # the triangulation
+        return
+
+    def refine_local_space(self, origin, supremum, bounds, centroid=1):
+        # Copy for later removal
+        origin_c = copy.copy(origin)
+        supremum_c = copy.copy(supremum)
+
+        # Initiate local variables redefined in later inner `for` loop:
+        vl, vu, a_vu = None, None, None
+
+        # Change the vector orientation so that it is only increasing
+        s_ov = list(origin)
+        s_origin = list(origin)
+        s_sv = list(supremum)
+        s_supremum = list(supremum)
+        for i, vi in enumerate(s_origin):
+            if s_ov[i] > s_sv[i]:
+                s_origin[i] = s_sv[i]
+                s_supremum[i] = s_ov[i]
+
+        vot = tuple(s_origin)
+        vut = tuple(s_supremum)  # Hyperrectangle supremum
+
+        vo = self.V[vot]  # initiate if doesn't exist yet
+        vs = self.V[vut]
+        # Start by finding the old centroid of the new space:
+        vco = self.split_edge(vo.x, vs.x)  # Split in case not centroid arg
+
+        # Find set of extreme vertices in current local space
+        sup_set = copy.copy(vco.nn)
+        # Cyclic group approach with second x_l --- x_u operation.
+
+        # These containers store the "lower" and "upper" vertices
+        # corresponding to the origin or supremum of every C2 group.
+        # It has the structure of `dim` times embedded lists each containing
+        # these vertices as the entire complex grows. Bounds[0] has to be done
+        # outside the loops before we have symmetric containers.
+        # NOTE: This means that bounds[0][1] must always exist
+
+        a_vl = copy.copy(list(vot))
+        a_vl[0] = vut[0]  # Update aN Origin
+        if tuple(a_vl) not in self.V.cache:
+            vo = self.V[vot]  # initiate if doesn't exist yet
+            vs = self.V[vut]
+            # Start by finding the old centroid of the new space:
+            vco = self.split_edge(vo.x, vs.x)  # Split in case not centroid arg
+
+            # Find set of extreme vertices in current local space
+            sup_set = copy.copy(vco.nn)
+            a_vl = copy.copy(list(vot))
+            a_vl[0] = vut[0]  # Update aN Origin
+            a_vl = self.V[tuple(a_vl)]
+        else:
+            a_vl = self.V[tuple(a_vl)]
+
+        c_v = self.split_edge(vo.x, a_vl.x)
+        c_v.connect(vco)
+        yield c_v.x
+        Cox = [[vo]]
+        Ccx = [[c_v]]
+        Cux = [[a_vl]]
+        ab_C = []  # Container for a + b operations
+        s_ab_C = []  # Container for symmetric a + b operations
+
+        # Loop over remaining bounds
+        for i, x in enumerate(bounds[1:]):
+            # Update lower and upper containers
+            Cox.append([])
+            Ccx.append([])
+            Cux.append([])
+            # try to access a second bound (if not, C1 is symmetric)
+            try:
+                t_a_vl = list(vot)
+                t_a_vl[i + 1] = vut[i + 1]
+
+                # New: lists are used anyway, so copy all
+                # %%
+                # Copy lists for iteration
+                cCox = [x[:] for x in Cox[:i + 1]]
+                cCcx = [x[:] for x in Ccx[:i + 1]]
+                cCux = [x[:] for x in Cux[:i + 1]]
+                # Try to connect aN lower source of previous a + b
+                # operation with a aN vertex
+                ab_Cc = copy.copy(ab_C)  # NOTE: We append ab_C in the
+                # (VL, VC, VU) for-loop, but we use the copy of the list in the
+                # ab_Cc for-loop.
+                s_ab_Cc = copy.copy(s_ab_C)
+
+                # Early try so that we don't have to copy the cache before
+                # moving on to next C1/C2: Try to add the operation of a new
+                # C2 product by accessing the upper bound
+                if tuple(t_a_vl) not in self.V.cache:
+                    # Raise error to continue symmetric refine
+                    raise IndexError
+                t_a_vu = list(vut)
+                t_a_vu[i + 1] = vut[i + 1]
+                if tuple(t_a_vu) not in self.V.cache:
+                    # Raise error to continue symmetric refine:
+                    raise IndexError
+
+                for vectors in s_ab_Cc:
+                    # s_ab_C.append([c_vc, vl, vu, a_vu])
+                    bc_vc = list(vectors[0].x)
+                    b_vl = list(vectors[1].x)
+                    b_vu = list(vectors[2].x)
+                    ba_vu = list(vectors[3].x)
+
+                    bc_vc[i + 1] = vut[i + 1]
+                    b_vl[i + 1] = vut[i + 1]
+                    b_vu[i + 1] = vut[i + 1]
+                    ba_vu[i + 1] = vut[i + 1]
+
+                    bc_vc = self.V[tuple(bc_vc)]
+                    bc_vc.connect(vco)  # NOTE: Unneeded?
+                    yield bc_vc
+
+                    # Split to centre, call this centre group "d = 0.5*a"
+                    d_bc_vc = self.split_edge(vectors[0].x, bc_vc.x)
+                    d_bc_vc.connect(bc_vc)
+                    d_bc_vc.connect(vectors[1])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[2])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[3])  # Connect all to centroid
+                    yield d_bc_vc.x
+                    b_vl = self.V[tuple(b_vl)]
+                    bc_vc.connect(b_vl)  # Connect aN cross pairs
+                    d_bc_vc.connect(b_vl)  # Connect all to centroid
+
+                    yield b_vl
+                    b_vu = self.V[tuple(b_vu)]
+                    bc_vc.connect(b_vu)  # Connect aN cross pairs
+                    d_bc_vc.connect(b_vu)  # Connect all to centroid
+
+                    b_vl_c = self.split_edge(b_vu.x, b_vl.x)
+                    bc_vc.connect(b_vl_c)
+
+                    yield b_vu
+                    ba_vu = self.V[tuple(ba_vu)]
+                    bc_vc.connect(ba_vu)  # Connect aN cross pairs
+                    d_bc_vc.connect(ba_vu)  # Connect all to centroid
+
+                    # Split the a + b edge of the initial triangulation:
+                    os_v = self.split_edge(vectors[1].x, ba_vu.x)  # o-s
+                    ss_v = self.split_edge(b_vl.x, ba_vu.x)  # s-s
+                    b_vu_c = self.split_edge(b_vu.x, ba_vu.x)
+                    bc_vc.connect(b_vu_c)
+                    yield os_v.x  # often equal to vco, but not always
+                    yield ss_v.x  # often equal to bc_vu, but not always
+                    yield ba_vu
+                    # Split remaining to centre, call this centre group
+                    # "d = 0.5*a"
+                    d_bc_vc = self.split_edge(vectors[0].x, bc_vc.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    yield d_bc_vc.x
+                    d_b_vl = self.split_edge(vectors[1].x, b_vl.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_b_vl)  # Connect dN cross pairs
+                    yield d_b_vl.x
+                    d_b_vu = self.split_edge(vectors[2].x, b_vu.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_b_vu)  # Connect dN cross pairs
+                    yield d_b_vu.x
+                    d_ba_vu = self.split_edge(vectors[3].x, ba_vu.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_ba_vu)  # Connect dN cross pairs
+                    yield d_ba_vu
+
+                    # comb = [c_vc, vl, vu, a_vl, a_vu,
+                    #       bc_vc, b_vl, b_vu, ba_vl, ba_vu]
+                    comb = [vl, vu, a_vu,
+                            b_vl, b_vu, ba_vu]
+                    comb_iter = itertools.combinations(comb, 2)
+                    for vecs in comb_iter:
+                        self.split_edge(vecs[0].x, vecs[1].x)
+                    # Add new list of cross pairs
+                    ab_C.append((d_bc_vc, vectors[1], b_vl, a_vu, ba_vu))
+                    ab_C.append((d_bc_vc, vl, b_vl, a_vu, ba_vu))  # = prev
+
+                for vectors in ab_Cc:
+                    bc_vc = list(vectors[0].x)
+                    b_vl = list(vectors[1].x)
+                    b_vu = list(vectors[2].x)
+                    ba_vl = list(vectors[3].x)
+                    ba_vu = list(vectors[4].x)
+                    bc_vc[i + 1] = vut[i + 1]
+                    b_vl[i + 1] = vut[i + 1]
+                    b_vu[i + 1] = vut[i + 1]
+                    ba_vl[i + 1] = vut[i + 1]
+                    ba_vu[i + 1] = vut[i + 1]
+                    bc_vc = self.V[tuple(bc_vc)]
+                    bc_vc.connect(vco)  # NOTE: Unneeded?
+                    yield bc_vc
+
+                    # Split to centre, call this centre group "d = 0.5*a"
+                    d_bc_vc = self.split_edge(vectors[0].x, bc_vc.x)
+                    d_bc_vc.connect(bc_vc)
+                    d_bc_vc.connect(vectors[1])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[2])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[3])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[4])  # Connect all to centroid
+                    yield d_bc_vc.x
+                    b_vl = self.V[tuple(b_vl)]
+                    bc_vc.connect(b_vl)  # Connect aN cross pairs
+                    d_bc_vc.connect(b_vl)  # Connect all to centroid
+                    yield b_vl
+                    b_vu = self.V[tuple(b_vu)]
+                    bc_vc.connect(b_vu)  # Connect aN cross pairs
+                    d_bc_vc.connect(b_vu)  # Connect all to centroid
+                    yield b_vu
+                    ba_vl = self.V[tuple(ba_vl)]
+                    bc_vc.connect(ba_vl)  # Connect aN cross pairs
+                    d_bc_vc.connect(ba_vl)  # Connect all to centroid
+                    self.split_edge(b_vu.x, ba_vl.x)
+                    yield ba_vl
+                    ba_vu = self.V[tuple(ba_vu)]
+                    bc_vc.connect(ba_vu)  # Connect aN cross pairs
+                    d_bc_vc.connect(ba_vu)  # Connect all to centroid
+                    # Split the a + b edge of the initial triangulation:
+                    os_v = self.split_edge(vectors[1].x, ba_vu.x)  # o-s
+                    ss_v = self.split_edge(b_vl.x, ba_vu.x)  # s-s
+                    yield os_v.x  # often equal to vco, but not always
+                    yield ss_v.x  # often equal to bc_vu, but not always
+                    yield ba_vu
+                    # Split remaining to centre, call this centre group
+                    # "d = 0.5*a"
+                    d_bc_vc = self.split_edge(vectors[0].x, bc_vc.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    yield d_bc_vc.x
+                    d_b_vl = self.split_edge(vectors[1].x, b_vl.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_b_vl)  # Connect dN cross pairs
+                    yield d_b_vl.x
+                    d_b_vu = self.split_edge(vectors[2].x, b_vu.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_b_vu)  # Connect dN cross pairs
+                    yield d_b_vu.x
+                    d_ba_vl = self.split_edge(vectors[3].x, ba_vl.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_ba_vl)  # Connect dN cross pairs
+                    yield d_ba_vl
+                    d_ba_vu = self.split_edge(vectors[4].x, ba_vu.x)
+                    d_bc_vc.connect(vco)  # NOTE: Unneeded?
+                    d_bc_vc.connect(d_ba_vu)  # Connect dN cross pairs
+                    yield d_ba_vu
+                    c_vc, vl, vu, a_vl, a_vu = vectors
+
+                    comb = [vl, vu, a_vl, a_vu,
+                            b_vl, b_vu, ba_vl, ba_vu]
+                    comb_iter = itertools.combinations(comb, 2)
+                    for vecs in comb_iter:
+                        self.split_edge(vecs[0].x, vecs[1].x)
+
+                    # Add new list of cross pairs
+                    ab_C.append((bc_vc, b_vl, b_vu, ba_vl, ba_vu))
+                    ab_C.append((d_bc_vc, d_b_vl, d_b_vu, d_ba_vl, d_ba_vu))
+                    ab_C.append((d_bc_vc, vectors[1], b_vl, a_vu, ba_vu))
+                    ab_C.append((d_bc_vc, vu, b_vu, a_vl, ba_vl))
+
+                for j, (VL, VC, VU) in enumerate(zip(cCox, cCcx, cCux)):
+                    for k, (vl, vc, vu) in enumerate(zip(VL, VC, VU)):
+                        # Build aN vertices for each lower-upper C3 group in N:
+                        a_vl = list(vl.x)
+                        a_vu = list(vu.x)
+                        a_vl[i + 1] = vut[i + 1]
+                        a_vu[i + 1] = vut[i + 1]
+                        a_vl = self.V[tuple(a_vl)]
+                        a_vu = self.V[tuple(a_vu)]
+                        # Note, build (a + vc) later for consistent yields
+                        # Split the a + b edge of the initial triangulation:
+                        c_vc = self.split_edge(vl.x, a_vu.x)
+                        self.split_edge(vl.x, vu.x)  # Equal to vc
+                        # Build cN vertices for each lower-upper C3 group in N:
+                        c_vc.connect(vco)
+                        c_vc.connect(vc)
+                        c_vc.connect(vl)  # Connect c + ac operations
+                        c_vc.connect(vu)  # Connect c + ac operations
+                        c_vc.connect(a_vl)  # Connect c + ac operations
+                        c_vc.connect(a_vu)  # Connect c + ac operations
+                        yield c_vc.x
+                        c_vl = self.split_edge(vl.x, a_vl.x)
+                        c_vl.connect(vco)
+                        c_vc.connect(c_vl)  # Connect cN group vertices
+                        yield c_vl.x
+                        # yield at end of loop:
+                        c_vu = self.split_edge(vu.x, a_vu.x)
+                        c_vu.connect(vco)
+                        # Connect remaining cN group vertices
+                        c_vc.connect(c_vu)  # Connect cN group vertices
+                        yield c_vu.x
+
+                        a_vc = self.split_edge(a_vl.x, a_vu.x)  # is (a + vc) ?
+                        a_vc.connect(vco)
+                        a_vc.connect(c_vc)
+
+                        # Storage for connecting c + ac operations:
+                        ab_C.append((c_vc, vl, vu, a_vl, a_vu))
+
+                        # Update the containers
+                        Cox[i + 1].append(vl)
+                        Cox[i + 1].append(vc)
+                        Cox[i + 1].append(vu)
+                        Ccx[i + 1].append(c_vl)
+                        Ccx[i + 1].append(c_vc)
+                        Ccx[i + 1].append(c_vu)
+                        Cux[i + 1].append(a_vl)
+                        Cux[i + 1].append(a_vc)
+                        Cux[i + 1].append(a_vu)
+
+                        # Update old containers
+                        Cox[j].append(c_vl)  # !
+                        Cox[j].append(a_vl)
+                        Ccx[j].append(c_vc)  # !
+                        Ccx[j].append(a_vc)  # !
+                        Cux[j].append(c_vu)  # !
+                        Cux[j].append(a_vu)
+
+                        # Yield new points
+                        yield a_vc.x
+
+            except IndexError:
+                for vectors in ab_Cc:
+                    ba_vl = list(vectors[3].x)
+                    ba_vu = list(vectors[4].x)
+                    ba_vl[i + 1] = vut[i + 1]
+                    ba_vu[i + 1] = vut[i + 1]
+                    ba_vu = self.V[tuple(ba_vu)]
+                    yield ba_vu
+                    d_bc_vc = self.split_edge(vectors[1].x, ba_vu.x)  # o-s
+                    yield ba_vu
+                    d_bc_vc.connect(vectors[1])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[2])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[3])  # Connect all to centroid
+                    d_bc_vc.connect(vectors[4])  # Connect all to centroid
+                    yield d_bc_vc.x
+                    ba_vl = self.V[tuple(ba_vl)]
+                    yield ba_vl
+                    d_ba_vl = self.split_edge(vectors[3].x, ba_vl.x)
+                    d_ba_vu = self.split_edge(vectors[4].x, ba_vu.x)
+                    d_ba_vc = self.split_edge(d_ba_vl.x, d_ba_vu.x)
+                    yield d_ba_vl
+                    yield d_ba_vu
+                    yield d_ba_vc
+                    c_vc, vl, vu, a_vl, a_vu = vectors
+                    comb = [vl, vu, a_vl, a_vu,
+                            ba_vl,
+                            ba_vu]
+                    comb_iter = itertools.combinations(comb, 2)
+                    for vecs in comb_iter:
+                        self.split_edge(vecs[0].x, vecs[1].x)
+
+                # Copy lists for iteration
+                cCox = Cox[i]
+                cCcx = Ccx[i]
+                cCux = Cux[i]
+                VL, VC, VU = cCox, cCcx, cCux
+                for k, (vl, vc, vu) in enumerate(zip(VL, VC, VU)):
+                    # Build aN vertices for each lower-upper pair in N:
+                    a_vu = list(vu.x)
+                    a_vu[i + 1] = vut[i + 1]
+
+                    # Connect vertices in N to corresponding vertices
+                    # in aN:
+                    a_vu = self.V[tuple(a_vu)]
+                    yield a_vl.x
+                    # Split the a + b edge of the initial triangulation:
+                    c_vc = self.split_edge(vl.x, a_vu.x)
+                    self.split_edge(vl.x, vu.x)  # Equal to vc
+                    c_vc.connect(vco)
+                    c_vc.connect(vc)
+                    c_vc.connect(vl)  # Connect c + ac operations
+                    c_vc.connect(vu)  # Connect c + ac operations
+                    c_vc.connect(a_vu)  # Connect c + ac operations
+                    yield (c_vc.x)
+                    c_vu = self.split_edge(vu.x,
+                                           a_vu.x)  # yield at end of loop
+                    c_vu.connect(vco)
+                    # Connect remaining cN group vertices
+                    c_vc.connect(c_vu)  # Connect cN group vertices
+                    yield (c_vu.x)
+
+                    # Update the containers
+                    Cox[i + 1].append(vu)
+                    Ccx[i + 1].append(c_vu)
+                    Cux[i + 1].append(a_vu)
+
+                    # Update old containers
+                    s_ab_C.append([c_vc, vl, vu, a_vu])
+
+                    yield a_vu.x
+
+        # Clean class trash
+        try:
+            del Cox
+            del Ccx
+            del Cux
+            del ab_C
+            del ab_Cc
+        except UnboundLocalError:
+            pass
+
+        try:
+            self.triangulated_vectors.remove((tuple(origin_c),
+                                              tuple(supremum_c)))
+        except ValueError:
+            # Turn this into a logging warning?
+            pass
+        # Add newly triangulated vectors:
+        for vs in sup_set:
+            self.triangulated_vectors.append((tuple(vco.x), tuple(vs.x)))
+
+        # Extra yield to ensure that the triangulation is completed
+        if centroid:
+            vcn_set = set()
+            c_nn_lists = []
+            for vs in sup_set:
+                # Build centroid
+                c_nn = self.vpool(vco.x, vs.x)
+                try:
+                    c_nn.remove(vcn_set)
+                except KeyError:
+                    pass
+                c_nn_lists.append(c_nn)
+
+            for c_nn in c_nn_lists:
+                try:
+                    c_nn.remove(vcn_set)
+                except KeyError:
+                    pass
+
+            for vs, c_nn in zip(sup_set, c_nn_lists):
+                # Build centroid
+                vcn = self.split_edge(vco.x, vs.x)
+                vcn_set.add(vcn)
+                try:  # Shouldn't be needed?
+                    c_nn.remove(vcn_set)
+                except KeyError:
+                    pass
+                for vnn in c_nn:
+                    vcn.connect(vnn)
+                yield vcn.x
+        else:
+            pass
+
+        yield vut
+        return
+
+    def refine_star(self, v):
+        """Refine the star domain of a vertex `v`."""
+        # Copy lists before iteration
+        vnn = copy.copy(v.nn)
+        v1nn = []
+        d_v0v1_set = set()
+        for v1 in vnn:
+            v1nn.append(copy.copy(v1.nn))
+
+        for v1, v1nn in zip(vnn, v1nn):
+            vnnu = v1nn.intersection(vnn)
+
+            d_v0v1 = self.split_edge(v.x, v1.x)
+            for o_d_v0v1 in d_v0v1_set:
+                d_v0v1.connect(o_d_v0v1)
+            d_v0v1_set.add(d_v0v1)
+            for v2 in vnnu:
+                d_v1v2 = self.split_edge(v1.x, v2.x)
+                d_v0v1.connect(d_v1v2)
+        return
+
+    def _split_edge(self, v1, v2):
+        v1 = self.V[v1]
+        v2 = self.V[v2]
+        # Destroy original edge, if it exists:
+        v1.disconnect(v2)
+        # Compute vertex on centre of edge:
+        try:
+            vct = (v2.x_a - v1.x_a) / 2.0 + v1.x_a
+        except TypeError:  # Allow for decimal operations
+            vct = (v2.x_a - v1.x_a) / decimal.Decimal(2.0) + v1.x_a
+
+        vc = self.V[tuple(vct)]
+        # Connect to original 2 vertices to the new centre vertex
+        vc.connect(v1)
+        vc.connect(v2)
+        return vc
+
+    def vpool(self, origin, supremum):
+        vot = tuple(origin)
+        vst = tuple(supremum)
+        # Initiate vertices in case they don't exist
+        vo = self.V[vot]
+        vs = self.V[vst]
+
+        # Remove origin - supremum disconnect
+
+        # Find the lower/upper bounds of the refinement hyperrectangle
+        bl = list(vot)
+        bu = list(vst)
+        for i, (voi, vsi) in enumerate(zip(vot, vst)):
+            if bl[i] > vsi:
+                bl[i] = vsi
+            if bu[i] < voi:
+                bu[i] = voi
+
+        #      NOTE: This is mostly done with sets/lists because we aren't sure
+        #            how well the numpy arrays will scale to thousands of
+        #             dimensions.
+        vn_pool = set()
+        vn_pool.update(vo.nn)
+        vn_pool.update(vs.nn)
+        cvn_pool = copy.copy(vn_pool)
+        for vn in cvn_pool:
+            for i, xi in enumerate(vn.x):
+                if bl[i] <= xi <= bu[i]:
+                    pass
+                else:
+                    try:
+                        vn_pool.remove(vn)
+                    except KeyError:
+                        pass  # NOTE: Not all neighbours are in initial pool
+        return vn_pool
+
+    def vf_to_vv(self, vertices, simplices):
+        """
+        Convert a vertex-face mesh to a vertex-vertex mesh used by this class
+
+        Parameters
+        ----------
+        vertices : list
+            Vertices
+        simplices : list
+            Simplices
+        """
+        if self.dim > 1:
+            for s in simplices:
+                edges = itertools.combinations(s, self.dim)
+                for e in edges:
+                    self.V[tuple(vertices[e[0]])].connect(
+                        self.V[tuple(vertices[e[1]])])
+        else:
+            for e in simplices:
+                self.V[tuple(vertices[e[0]])].connect(
+                    self.V[tuple(vertices[e[1]])])
+        return
+
+    def connect_vertex_non_symm(self, v_x, near=None):
+        """
+        Adds a vertex at coords v_x to the complex that is not symmetric to the
+        initial triangulation and sub-triangulation.
+
+        If near is specified (for example; a star domain or collections of
+        cells known to contain v) then only those simplices containd in near
+        will be searched, this greatly speeds up the process.
+
+        If near is not specified this method will search the entire simplicial
+        complex structure.
+
+        Parameters
+        ----------
+        v_x : tuple
+            Coordinates of non-symmetric vertex
+        near : set or list
+            List of vertices, these are points near v to check for
+        """
+        if near is None:
+            star = self.V
+        else:
+            star = near
+        # Create the vertex origin
+        if tuple(v_x) in self.V.cache:
+            if self.V[v_x] in self.V_non_symm:
+                pass
+            else:
+                return
+
+        self.V[v_x]
+        found_nn = False
+        S_rows = []
+        for v in star:
+            S_rows.append(v.x)
+
+        S_rows = np.array(S_rows)
+        A = np.array(S_rows) - np.array(v_x)
+        # Iterate through all the possible simplices of S_rows
+        for s_i in itertools.combinations(range(S_rows.shape[0]),
+                                          r=self.dim + 1):
+            # Check if connected, else s_i is not a simplex
+            valid_simplex = True
+            for i in itertools.combinations(s_i, r=2):
+                # Every combination of vertices must be connected, we check of
+                # the current iteration of all combinations of s_i are
+                # connected we break the loop if it is not.
+                if ((self.V[tuple(S_rows[i[1]])] not in
+                        self.V[tuple(S_rows[i[0]])].nn)
+                    and (self.V[tuple(S_rows[i[0]])] not in
+                         self.V[tuple(S_rows[i[1]])].nn)):
+                    valid_simplex = False
+                    break
+
+            S = S_rows[tuple([s_i])]
+            if valid_simplex:
+                if self.deg_simplex(S, proj=None):
+                    valid_simplex = False
+
+            # If s_i is a valid simplex we can test if v_x is inside si
+            if valid_simplex:
+                # Find the A_j0 value from the precalculated values
+                A_j0 = A[tuple([s_i])]
+                if self.in_simplex(S, v_x, A_j0):
+                    found_nn = True
+                    # breaks the main for loop, s_i is the target simplex:
+                    break
+
+        # Connect the simplex to point
+        if found_nn:
+            for i in s_i:
+                self.V[v_x].connect(self.V[tuple(S_rows[i])])
+        # Attached the simplex to storage for all non-symmetric vertices
+        self.V_non_symm.append(self.V[v_x])
+        # this bool value indicates a successful connection if True:
+        return found_nn
+
+    def in_simplex(self, S, v_x, A_j0=None):
+        """Check if a vector v_x is in simplex `S`.
+
+        Parameters
+        ----------
+        S : array_like
+            Array containing simplex entries of vertices as rows
+        v_x :
+            A candidate vertex
+        A_j0 : array, optional,
+            Allows for A_j0 to be pre-calculated
+
+        Returns
+        -------
+        res : boolean
+            True if `v_x` is in `S`
+        """
+        A_11 = np.delete(S, 0, 0) - S[0]
+
+        sign_det_A_11 = np.sign(np.linalg.det(A_11))
+        if sign_det_A_11 == 0:
+            # NOTE: We keep the variable A_11, but we loop through A_jj
+            # ind=
+            # while sign_det_A_11 == 0:
+            #    A_11 = np.delete(S, ind, 0) - S[ind]
+            #    sign_det_A_11 = np.sign(np.linalg.det(A_11))
+
+            sign_det_A_11 = -1  # TODO: Choose another det of j instead?
+            # TODO: Unlikely to work in many cases
+
+        if A_j0 is None:
+            A_j0 = S - v_x
+
+        for d in range(self.dim + 1):
+            det_A_jj = (-1)**d * sign_det_A_11
+            # TODO: Note that scipy might be faster to add as an optional
+            #       dependency
+            sign_det_A_j0 = np.sign(np.linalg.det(np.delete(A_j0, d,
+                                                                     0)))
+            # TODO: Note if sign_det_A_j0 == then the point is coplanar to the
+            #       current simplex facet, so perhaps return True and attach?
+            if det_A_jj == sign_det_A_j0:
+                continue
+            else:
+                return False
+
+        return True
+
+    def deg_simplex(self, S, proj=None):
+        """Test a simplex S for degeneracy (linear dependence in R^dim).
+
+        Parameters
+        ----------
+        S : np.array
+            Simplex with rows as vertex vectors
+        proj : array, optional,
+            If the projection S[1:] - S[0] is already
+            computed it can be added as an optional argument.
+        """
+        # Strategy: we test all combination of faces, if any of the
+        # determinants are zero then the vectors lie on the same face and is
+        # therefore linearly dependent in the space of R^dim
+        if proj is None:
+            proj = S[1:] - S[0]
+
+        # TODO: Is checking the projection of one vertex against faces of other
+        #       vertices sufficient? Or do we need to check more vertices in
+        #       dimensions higher than 2?
+        # TODO: Literature seems to suggest using proj.T, but why is this
+        #       needed?
+        if np.linalg.det(proj) == 0.0:  # TODO: Replace with tolerance?
+            return True  # Simplex is degenerate
+        else:
+            return False  # Simplex is not degenerate
+
+
+import collections
+from abc import ABC, abstractmethod
+
+import numpy as np
+
+from scipy._lib._util import MapWrapper
+
+
+class VertexBase(ABC):
+    """
+    Base class for a vertex.
+    """
+    def __init__(self, x, nn=None, index=None):
+        """
+        Initiation of a vertex object.
+
+        Parameters
+        ----------
+        x : tuple or vector
+            The geometric location (domain).
+        nn : list, optional
+            Nearest neighbour list.
+        index : int, optional
+            Index of vertex.
+        """
+        self.x = x
+        self.hash = hash(self.x)  # Save precomputed hash
+
+        if nn is not None:
+            self.nn = set(nn)  # can use .indexupdate to add a new list
+        else:
+            self.nn = set()
+
+        self.index = index
+
+    def __hash__(self):
+        return self.hash
+
+    def __getattr__(self, item):
+        if item not in ['x_a']:
+            raise AttributeError(f"{type(self)} object has no attribute "
+                                 f"'{item}'")
+        if item == 'x_a':
+            self.x_a = np.array(self.x)
+            return self.x_a
+
+    @abstractmethod
+    def connect(self, v):
+        raise NotImplementedError("This method is only implemented with an "
+                                  "associated child of the base class.")
+
+    @abstractmethod
+    def disconnect(self, v):
+        raise NotImplementedError("This method is only implemented with an "
+                                  "associated child of the base class.")
+
+    def star(self):
+        """Returns the star domain ``st(v)`` of the vertex.
+
+        Parameters
+        ----------
+        v :
+            The vertex ``v`` in ``st(v)``
+
+        Returns
+        -------
+        st : set
+            A set containing all the vertices in ``st(v)``
+        """
+        self.st = self.nn
+        self.st.add(self)
+        return self.st
+
+
+class VertexScalarField(VertexBase):
+    """
+    Add homology properties of a scalar field f: R^n --> R associated with
+    the geometry built from the VertexBase class
+    """
+
+    def __init__(self, x, field=None, nn=None, index=None, field_args=(),
+                 g_cons=None, g_cons_args=()):
+        """
+        Parameters
+        ----------
+        x : tuple,
+            vector of vertex coordinates
+        field : callable, optional
+            a scalar field f: R^n --> R associated with the geometry
+        nn : list, optional
+            list of nearest neighbours
+        index : int, optional
+            index of the vertex
+        field_args : tuple, optional
+            additional arguments to be passed to field
+        g_cons : callable, optional
+            constraints on the vertex
+        g_cons_args : tuple, optional
+            additional arguments to be passed to g_cons
+
+        """
+        super().__init__(x, nn=nn, index=index)
+
+        # Note Vertex is only initiated once for all x so only
+        # evaluated once
+        # self.feasible = None
+
+        # self.f is externally defined by the cache to allow parallel
+        # processing
+        # None type that will break arithmetic operations unless defined
+        # self.f = None
+
+        self.check_min = True
+        self.check_max = True
+
+    def connect(self, v):
+        """Connects self to another vertex object v.
+
+        Parameters
+        ----------
+        v : VertexBase or VertexScalarField object
+        """
+        if v is not self and v not in self.nn:
+            self.nn.add(v)
+            v.nn.add(self)
+
+            # Flags for checking homology properties:
+            self.check_min = True
+            self.check_max = True
+            v.check_min = True
+            v.check_max = True
+
+    def disconnect(self, v):
+        if v in self.nn:
+            self.nn.remove(v)
+            v.nn.remove(self)
+
+            # Flags for checking homology properties:
+            self.check_min = True
+            self.check_max = True
+            v.check_min = True
+            v.check_max = True
+
+    def minimiser(self):
+        """Check whether this vertex is strictly less than all its
+           neighbours"""
+        if self.check_min:
+            self._min = all(self.f < v.f for v in self.nn)
+            self.check_min = False
+
+        return self._min
+
+    def maximiser(self):
+        """
+        Check whether this vertex is strictly greater than all its
+        neighbours.
+        """
+        if self.check_max:
+            self._max = all(self.f > v.f for v in self.nn)
+            self.check_max = False
+
+        return self._max
+
+
+class VertexVectorField(VertexBase):
+    """
+    Add homology properties of a scalar field f: R^n --> R^m associated with
+    the geometry built from the VertexBase class.
+    """
+
+    def __init__(self, x, sfield=None, vfield=None, field_args=(),
+                 vfield_args=(), g_cons=None,
+                 g_cons_args=(), nn=None, index=None):
+        super().__init__(x, nn=nn, index=index)
+
+        raise NotImplementedError("This class is still a work in progress")
+
+
+class VertexCacheBase:
+    """Base class for a vertex cache for a simplicial complex."""
+    def __init__(self):
+
+        self.cache = collections.OrderedDict()
+        self.nfev = 0  # Feasible points
+        self.index = -1
+
+    def __iter__(self):
+        for v in self.cache:
+            yield self.cache[v]
+        return
+
+    def size(self):
+        """Returns the size of the vertex cache."""
+        return self.index + 1
+
+    def print_out(self):
+        headlen = len(f"Vertex cache of size: {len(self.cache)}:")
+        print('=' * headlen)
+        print(f"Vertex cache of size: {len(self.cache)}:")
+        print('=' * headlen)
+        for v in self.cache:
+            self.cache[v].print_out()
+
+
+class VertexCube(VertexBase):
+    """Vertex class to be used for a pure simplicial complex with no associated
+    differential geometry (single level domain that exists in R^n)"""
+    def __init__(self, x, nn=None, index=None):
+        super().__init__(x, nn=nn, index=index)
+
+    def connect(self, v):
+        if v is not self and v not in self.nn:
+            self.nn.add(v)
+            v.nn.add(self)
+
+    def disconnect(self, v):
+        if v in self.nn:
+            self.nn.remove(v)
+            v.nn.remove(self)
+
+
+class VertexCacheIndex(VertexCacheBase):
+    def __init__(self):
+        """
+        Class for a vertex cache for a simplicial complex without an associated
+        field. Useful only for building and visualising a domain complex.
+
+        Parameters
+        ----------
+        """
+        super().__init__()
+        self.Vertex = VertexCube
+
+    def __getitem__(self, x, nn=None):
+        try:
+            return self.cache[x]
+        except KeyError:
+            self.index += 1
+            xval = self.Vertex(x, index=self.index)
+            # logging.info("New generated vertex at x = {}".format(x))
+            # NOTE: Surprisingly high performance increase if logging
+            # is commented out
+            self.cache[x] = xval
+            return self.cache[x]
+
+
+class VertexCacheField(VertexCacheBase):
+    def __init__(self, field=None, field_args=(), g_cons=None, g_cons_args=(),
+                 workers=1):
+        """
+        Class for a vertex cache for a simplicial complex with an associated
+        field.
+
+        Parameters
+        ----------
+        field : callable
+            Scalar or vector field callable.
+        field_args : tuple, optional
+            Any additional fixed parameters needed to completely specify the
+            field function
+        g_cons : dict or sequence of dict, optional
+            Constraints definition.
+            Function(s) ``R**n`` in the form::
+        g_cons_args : tuple, optional
+            Any additional fixed parameters needed to completely specify the
+            constraint functions
+        workers : int  optional
+            Uses `multiprocessing.Pool <multiprocessing>`) to compute the field
+             functions in parallel.
+
+        """
+        super().__init__()
+        self.index = -1
+        self.Vertex = VertexScalarField
+        self.field = field
+        self.field_args = field_args
+        self.wfield = FieldWrapper(field, field_args)  # if workers is not 1
+
+        self.g_cons = g_cons
+        self.g_cons_args = g_cons_args
+        self.wgcons = ConstraintWrapper(g_cons, g_cons_args)
+        self.gpool = set()  # A set of tuples to process for feasibility
+
+        # Field processing objects
+        self.fpool = set()  # A set of tuples to process for scalar function
+        self.sfc_lock = False  # True if self.fpool is non-Empty
+
+        self.workers = workers
+        self._mapwrapper = MapWrapper(workers)
+
+        if workers == 1:
+            self.process_gpool = self.proc_gpool
+            if g_cons is None:
+                self.process_fpool = self.proc_fpool_nog
+            else:
+                self.process_fpool = self.proc_fpool_g
+        else:
+            self.process_gpool = self.pproc_gpool
+            if g_cons is None:
+                self.process_fpool = self.pproc_fpool_nog
+            else:
+                self.process_fpool = self.pproc_fpool_g
+
+    def __getitem__(self, x, nn=None):
+        try:
+            return self.cache[x]
+        except KeyError:
+            self.index += 1
+            xval = self.Vertex(x, field=self.field, nn=nn, index=self.index,
+                               field_args=self.field_args,
+                               g_cons=self.g_cons,
+                               g_cons_args=self.g_cons_args)
+
+            self.cache[x] = xval  # Define in cache
+            self.gpool.add(xval)  # Add to pool for processing feasibility
+            self.fpool.add(xval)  # Add to pool for processing field values
+            return self.cache[x]
+
+    def __getstate__(self):
+        self_dict = self.__dict__.copy()
+        del self_dict['pool']
+        return self_dict
+
+    def process_pools(self):
+        if self.g_cons is not None:
+            self.process_gpool()
+        self.process_fpool()
+        self.proc_minimisers()
+
+    def feasibility_check(self, v):
+        v.feasible = True
+        for g, args in zip(self.g_cons, self.g_cons_args):
+            # constraint may return more than 1 value.
+            if np.any(g(v.x_a, *args) < 0.0):
+                v.f = np.inf
+                v.feasible = False
+                break
+
+    def compute_sfield(self, v):
+        """Compute the scalar field values of a vertex object `v`.
+
+        Parameters
+        ----------
+        v : VertexBase or VertexScalarField object
+        """
+        try:
+            v.f = self.field(v.x_a, *self.field_args)
+            self.nfev += 1
+        except AttributeError:
+            v.f = np.inf
+            # logging.warning(f"Field function not found at x = {self.x_a}")
+        if np.isnan(v.f):
+            v.f = np.inf
+
+    def proc_gpool(self):
+        """Process all constraints."""
+        if self.g_cons is not None:
+            for v in self.gpool:
+                self.feasibility_check(v)
+        # Clean the pool
+        self.gpool = set()
+
+    def pproc_gpool(self):
+        """Process all constraints in parallel."""
+        gpool_l = []
+        for v in self.gpool:
+            gpool_l.append(v.x_a)
+
+        G = self._mapwrapper(self.wgcons.gcons, gpool_l)
+        for v, g in zip(self.gpool, G):
+            v.feasible = g  # set vertex object attribute v.feasible = g (bool)
+
+    def proc_fpool_g(self):
+        """Process all field functions with constraints supplied."""
+        for v in self.fpool:
+            if v.feasible:
+                self.compute_sfield(v)
+        # Clean the pool
+        self.fpool = set()
+
+    def proc_fpool_nog(self):
+        """Process all field functions with no constraints supplied."""
+        for v in self.fpool:
+            self.compute_sfield(v)
+        # Clean the pool
+        self.fpool = set()
+
+    def pproc_fpool_g(self):
+        """
+        Process all field functions with constraints supplied in parallel.
+        """
+        self.wfield.func
+        fpool_l = []
+        for v in self.fpool:
+            if v.feasible:
+                fpool_l.append(v.x_a)
+            else:
+                v.f = np.inf
+        F = self._mapwrapper(self.wfield.func, fpool_l)
+        for va, f in zip(fpool_l, F):
+            vt = tuple(va)
+            self[vt].f = f  # set vertex object attribute v.f = f
+            self.nfev += 1
+        # Clean the pool
+        self.fpool = set()
+
+    def pproc_fpool_nog(self):
+        """
+        Process all field functions with no constraints supplied in parallel.
+        """
+        self.wfield.func
+        fpool_l = []
+        for v in self.fpool:
+            fpool_l.append(v.x_a)
+        F = self._mapwrapper(self.wfield.func, fpool_l)
+        for va, f in zip(fpool_l, F):
+            vt = tuple(va)
+            self[vt].f = f  # set vertex object attribute v.f = f
+            self.nfev += 1
+        # Clean the pool
+        self.fpool = set()
+
+    def proc_minimisers(self):
+        """Check for minimisers."""
+        for v in self:
+            v.minimiser()
+            v.maximiser()
+
+
+class ConstraintWrapper:
+    """Object to wrap constraints to pass to `multiprocessing.Pool`."""
+    def __init__(self, g_cons, g_cons_args):
+        self.g_cons = g_cons
+        self.g_cons_args = g_cons_args
+
+    def gcons(self, v_x_a):
+        vfeasible = True
+        for g, args in zip(self.g_cons, self.g_cons_args):
+            # constraint may return more than 1 value.
+            if np.any(g(v_x_a, *args) < 0.0):
+                vfeasible = False
+                break
+        return vfeasible
+
+
+class FieldWrapper:
+    """Object to wrap field to pass to `multiprocessing.Pool`."""
+    def __init__(self, field, field_args):
+        self.field = field
+        self.field_args = field_args
+
+    def func(self, v_x_a):
+        try:
+            v_f = self.field(v_x_a, *self.field_args)
+        except Exception:
+            v_f = np.inf
+        if np.isnan(v_f):
+            v_f = np.inf
+
+        return v_f

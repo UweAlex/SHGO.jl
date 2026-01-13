@@ -11,13 +11,12 @@ echo. >> "%OUTPUT%"
 echo ------------------------Dateitrennzeichen--------------------------------------------- >> "%OUTPUT%"
 
 :: Alle relevanten Dateien rekursiv verarbeiten
-for /r %%F in (*.jl, Project.toml, README.md, .gitignore) do (
+for /r %%F in (*.jl, Project.toml, README.md, *.yml) do (
     if exist "%%F" (
         echo. >> "%OUTPUT%"
         echo "Datei: %%F" >> "%OUTPUT%"
-        echo ```julia >> "%OUTPUT%"
+        echo. >> "%OUTPUT%"
         type "%%F" >> "%OUTPUT%"
-        echo ``` >> "%OUTPUT%"
         echo. >> "%OUTPUT%"
         echo ------------------------Dateitrennzeichen--------------------------------------------- >> "%OUTPUT%"
     )
