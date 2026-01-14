@@ -11,6 +11,18 @@ using LinearAlgebra
 
 const NOTF = NonlinearOptimizationTestFunctions
 
+# Helper to get test function (compatible with different NOTF versions)
+function get_test_function(name::String; n::Int=2)
+    tf = NOTF.TEST_FUNCTIONS[name]
+    # Try new API first, fall back to old
+    if isdefined(NOTF, :fixed)
+        return NOTF.fixed(tf; n=n)
+    else
+        # Old API - function is already usable
+        return tf
+    end
+end
+
 # Known minima from literature
 const KNOWN_MINIMA = Dict(
     "sphere" => [([0.0, 0.0], 0.0)],
@@ -92,7 +104,7 @@ end
     @testset "Single-Minimum Functions" begin
         for fname in ("sphere", "rosenbrock")
             @testset "$fname" begin
-                tf = NOTF.fixed(NOTF.TEST_FUNCTIONS[fname]; n=2)
+                tf = get_test_function(fname; n=2)
                 result = SHGO.analyze(tf; n_div_initial=10, n_div_max=20)
 
                 @test result.num_basins ≥ 1
@@ -106,7 +118,7 @@ end
 
     @testset "Multi-Minimum Functions" begin
         @testset "Himmelblau" begin
-            tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["himmelblau"]; n=2)
+            tf = get_test_function("himmelblau"; n=2)
             result = SHGO.analyze(
                 tf;
                 n_div_initial=20,
@@ -120,7 +132,7 @@ end
         end
 
         @testset "Six-Hump Camelback" begin
-            tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["sixhumpcamelback"]; n=2)
+            tf = get_test_function("sixhumpcamelback"; n=2)
             result = SHGO.analyze(
                 tf;
                 n_div_initial=20,
@@ -139,7 +151,7 @@ end
     end
 
     @testset "Convergence" begin
-        tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["sphere"]; n=2)
+        tf = get_test_function("sphere"; n=2)
         result = SHGO.analyze(
             tf;
             n_div_initial=5,
@@ -152,7 +164,7 @@ end
     end
 
     @testset "Backward Compatibility" begin
-        tf = NOTF.fixed(NOTF.TEST_FUNCTIONS["sphere"]; n=2)
+        tf = get_test_function("sphere"; n=2)
 
         result = SHGO.analyze(tf; n_div=10, use_gradient_pruning=false)
 
