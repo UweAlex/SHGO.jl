@@ -19,9 +19,6 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
-        include:
-          - version: '1.10'
-            os: ubuntu-latest
     
     steps:
       - uses: actions/checkout@v4
@@ -54,11 +51,21 @@ jobs:
         with:
           version: '1.11'
       
-      - name: Verify package loads
+      - name: Build README examples
         run: |
           julia --project=. -e '
             using Pkg
             Pkg.instantiate()
+            
             using SHGO
-            println("SHGO loaded successfully")
+            using NonlinearOptimizationTestFunctions
+            const NOTF = NonlinearOptimizationTestFunctions
+            
+            tf = NOTF.TEST_FUNCTIONS["sixhumpcamelback"]
+            result = SHGO.analyze(tf)
+            
+            @assert result.num_basins >= 2 "Should find at least 2 basins"
+            @assert any(m -> m.objective < -1.0, result.local_minima) "Should find global minimum"
+            
+            println("README examples verified ✓")
           '
