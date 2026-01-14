@@ -18,6 +18,7 @@ PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [compat]
 BenchmarkTools = "1.6.3"
@@ -26,3 +27,4 @@ Conda = "1.10.3"
 CondaPkg = "0.2.33"
 DataStructures = "0.19.3"
 PyCall = "1.96.4"
+Test = "1.11.0"
